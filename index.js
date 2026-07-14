@@ -92,7 +92,10 @@ function startListeners() {
 
 async function processNotificationDoc(snapshot) {
   const notification = snapshot.data() || {};
-  if (["sent", "partial", "no_tokens", "skipped", "processing"].includes(notification.pushStatus)) {
+  if (["sent", "partial", "no_tokens", "skipped"].includes(notification.pushStatus)) {
+    return;
+  }
+  if (notification.pushStatus === "processing" && !isStaleProcessing(notification.pushCheckedAt)) {
     return;
   }
 
@@ -205,7 +208,17 @@ async function processNotificationDoc(snapshot) {
 
 async function processActivityDoc(snapshot) {
   const activity = snapshot.data() || {};
-  if (activity.notificationFanoutStatus === "created" || activity.notificationFanoutStatus === "processing") {
+  if (
+    activity.notificationFanoutStatus === "created" ||
+    activity.notificationFanoutStatus === "no_recipients" ||
+    activity.notificationFanoutStatus === "skipped"
+  ) {
+    return;
+  }
+  if (
+    activity.notificationFanoutStatus === "processing" &&
+    !isStaleProcessing(activity.notificationFanoutAt)
+  ) {
     return;
   }
 
@@ -354,6 +367,12 @@ function buildAppUsageBody(deviceName, apps) {
     })
     .join(", ");
   return `${deviceName}: ${topApps}`;
+}
+
+function isStaleProcessing(value) {
+  if (!value || typeof value.toDate !== "function") return true;
+  const processingAgeMs = Date.now() - value.toDate().getTime();
+  return processingAgeMs > 5 * 60 * 1000;
 }
 
 function shutdown() {
