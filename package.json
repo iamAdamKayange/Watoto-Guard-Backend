@@ -1,0 +1,17 @@
+{
+  "name": "watoto-guard-functions",
+  "description": "Cloud Functions for WatotoGuard notification delivery",
+  "private": true,
+  "main": "index.js",
+  "engines": {
+    "node": "22"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "lint": "node --check index.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "firebase-admin": "^13.5.0"
+  }
+}
