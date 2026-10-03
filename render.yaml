@@ -20,6 +20,8 @@
         sync: false
       - key: RESEND_FROM_EMAIL
         sync: false
+      - key: SENDLIB_API_KEY
+        sync: false
       - key: OTP_HASH_SECRET
         sync: false
       - key: AUTH_TOKEN_SECRET

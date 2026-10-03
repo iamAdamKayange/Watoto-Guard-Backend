@@ -41,33 +41,35 @@ enum SchoolRequestStatus {
 }
 
 model User {
-  id           String   @id @default(cuid())
+  id                      String                   @id @default(cuid())
   // Legacy Firebase UID retained only to preserve existing cross-document links during migration.
-  firebaseUid  String   @unique
-  passwordHash String?
-  email        String   @unique
-  fullName     String
-  phone        String?
-  emailVerified Boolean @default(false)
-  profileImageUrl String?
-  preferences  Json     @default("{}")
-  isPremium    Boolean  @default(false)
-  premiumExpiry DateTime?
-  role         Role
-  schoolId     String?
-  isActive     Boolean  @default(true)
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
-  school       School?  @relation(fields: [schoolId], references: [id])
-  children     ParentChild[] @relation("Parent")
-  taught       TeacherStudent[] @relation("Teacher")
-  devices      Device[]
-  notifications Notification[]
-  dailySummaries DailyUsageSummary[]
-  notificationPreference NotificationPreference?
-  auditActor   AuditLog[] @relation("AuditActor")
-  reviewedSchoolRequests SchoolAccessRequest[] @relation("SchoolRequestReviewer")
-  sentSchoolInvitations SchoolInvitation[] @relation("SchoolInvitationCreator")
+  firebaseUid             String                   @unique
+  passwordHash            String?
+  email                   String                   @unique
+  fullName                String
+  phone                   String?
+  emailVerified           Boolean                  @default(false)
+  profileImageUrl         String?
+  preferences             Json                     @default("{}")
+  isPremium               Boolean                  @default(false)
+  premiumExpiry           DateTime?
+  role                    Role
+  schoolId                String?
+  isActive                Boolean                  @default(true)
+  createdAt               DateTime                 @default(now())
+  updatedAt               DateTime                 @updatedAt
+  school                  School?                  @relation(fields: [schoolId], references: [id])
+  children                ParentChild[]            @relation("Parent")
+  taught                  TeacherStudent[]         @relation("Teacher")
+  devices                 Device[]
+  notifications           Notification[]
+  dailySummaries          DailyUsageSummary[]
+  notificationPreference  NotificationPreference?
+  auditActor              AuditLog[]               @relation("AuditActor")
+  reviewedSchoolRequests  SchoolAccessRequest[]    @relation("SchoolRequestReviewer")
+  sentSchoolInvitations   SchoolInvitation[]       @relation("SchoolInvitationCreator")
+  emailChangeVerification EmailChangeVerification?
+
   @@index([schoolId, role])
 }
 
@@ -79,45 +81,63 @@ model DeletedAuthIdentity {
 }
 
 model EmailOtpVerification {
-  email                String   @id
-  otpHash              String
-  fullName             String
-  phone                String?
-  attempts             Int      @default(0)
-  sendsInWindow        Int      @default(0)
-  sendWindowStartedAt  DateTime @default(now())
-  sentAt               DateTime
-  expiresAt            DateTime
-  verifiedAt           DateTime?
+  email                 String    @id
+  otpHash               String
+  fullName              String
+  phone                 String?
+  attempts              Int       @default(0)
+  sendsInWindow         Int       @default(0)
+  sendWindowStartedAt   DateTime  @default(now())
+  sentAt                DateTime
+  expiresAt             DateTime
+  verifiedAt            DateTime?
   registrationExpiresAt DateTime?
-  consumedAt           DateTime?
-  createdAt            DateTime @default(now())
-  updatedAt            DateTime @updatedAt
+  consumedAt            DateTime?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@index([expiresAt])
+}
+
+model EmailChangeVerification {
+  id                  String   @id @default(cuid())
+  userId              String   @unique
+  email               String   @unique
+  otpHash             String
+  attempts            Int      @default(0)
+  sendsInWindow       Int      @default(0)
+  sendWindowStartedAt DateTime @default(now())
+  sentAt              DateTime
+  expiresAt           DateTime
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
   @@index([expiresAt])
 }
 
 model School {
-  id            String   @id @default(cuid())
-  name          String
-  code          String?
-  address       String?
-  phone         String?
-  email         String?
-  website       String?
-  logoUrl       String?
-  description   String?
-  motto         String?
-  principalName String?
-  isActive      Boolean  @default(true)
-  settings      Json     @default("{}")
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
-  users         User[]
-  children      Child[]
-  classes       SchoolClass[]
-  devices       Device[]
+  id             String                @id @default(cuid())
+  name           String
+  code           String?
+  address        String?
+  phone          String?
+  email          String?
+  website        String?
+  logoUrl        String?
+  description    String?
+  motto          String?
+  principalName  String?
+  isActive       Boolean               @default(true)
+  settings       Json                  @default("{}")
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+  users          User[]
+  children       Child[]
+  classes        SchoolClass[]
+  devices        Device[]
   accessRequests SchoolAccessRequest[]
-  invitations   SchoolInvitation[]
+  invitations    SchoolInvitation[]
 }
 
 model SchoolAccessRequest {
@@ -140,24 +160,26 @@ model SchoolAccessRequest {
   updatedAt     DateTime            @updatedAt
   school        School?             @relation(fields: [schoolId], references: [id], onDelete: SetNull)
   reviewer      User?               @relation("SchoolRequestReviewer", fields: [reviewerId], references: [id], onDelete: SetNull)
+
   @@index([status, createdAt])
   @@index([email, createdAt])
 }
 
 model SchoolInvitation {
-  id          String   @id @default(cuid())
-  tokenHash   String   @unique
-  email       String
-  fullName    String
-  phone       String?
-  role        Role
-  schoolId    String
-  creatorId   String?
-  expiresAt   DateTime
-  usedAt      DateTime?
-  createdAt   DateTime @default(now())
-  school      School   @relation(fields: [schoolId], references: [id], onDelete: Cascade)
-  creator     User?    @relation("SchoolInvitationCreator", fields: [creatorId], references: [id], onDelete: SetNull)
+  id        String    @id @default(cuid())
+  tokenHash String    @unique
+  email     String
+  fullName  String
+  phone     String?
+  role      Role
+  schoolId  String
+  creatorId String?
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+  school    School    @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  creator   User?     @relation("SchoolInvitationCreator", fields: [creatorId], references: [id], onDelete: SetNull)
+
   @@index([schoolId, email, usedAt])
   @@index([expiresAt])
 }
@@ -168,42 +190,45 @@ model SchoolClass {
   name         String
   gradeLevel   String?
   academicYear String?
-  settings      Json     @default("{}")
+  settings     Json     @default("{}")
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
-  school       School  @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  school       School   @relation(fields: [schoolId], references: [id], onDelete: Cascade)
   children     Child[]
+
   @@unique([schoolId, name])
 }
 
 model Child {
-  id        String   @id @default(cuid())
-  linkCode  String?  @unique
-  fullName  String
-  schoolId  String?
-  classId   String?
-  className String?
-  isActive  Boolean  @default(true)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  school    School?  @relation(fields: [schoolId], references: [id])
-  classroom SchoolClass? @relation(fields: [classId], references: [id])
-  parents   ParentChild[] @relation("Child")
-  teachers  TeacherStudent[] @relation("Student")
-  devices   Device[]
-  notifications Notification[]
+  id             String                @id @default(cuid())
+  linkCode       String?               @unique
+  fullName       String
+  schoolId       String?
+  classId        String?
+  className      String?
+  isActive       Boolean               @default(true)
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+  school         School?               @relation(fields: [schoolId], references: [id])
+  classroom      SchoolClass?          @relation(fields: [classId], references: [id])
+  parents        ParentChild[]         @relation("Child")
+  teachers       TeacherStudent[]      @relation("Student")
+  devices        Device[]
+  notifications  Notification[]
   activityEvents DeviceActivityEvent[]
-  locations DeviceLocation[]
-  screenTime ScreenTimeRecord[]
+  locations      DeviceLocation[]
+  screenTime     ScreenTimeRecord[]
+
   @@index([schoolId])
 }
 
 model ParentChild {
-  parentId String
-  childId  String
+  parentId  String
+  childId   String
   createdAt DateTime @default(now())
-  parent User @relation("Parent", fields: [parentId], references: [id], onDelete: Cascade)
-  child Child @relation("Child", fields: [childId], references: [id], onDelete: Cascade)
+  parent    User     @relation("Parent", fields: [parentId], references: [id], onDelete: Cascade)
+  child     Child    @relation("Child", fields: [childId], references: [id], onDelete: Cascade)
+
   @@id([parentId, childId])
   @@index([childId])
 }
@@ -212,43 +237,45 @@ model TeacherStudent {
   teacherId String
   studentId String
   createdAt DateTime @default(now())
-  teacher User @relation("Teacher", fields: [teacherId], references: [id], onDelete: Cascade)
-  student Child @relation("Student", fields: [studentId], references: [id], onDelete: Cascade)
+  teacher   User     @relation("Teacher", fields: [teacherId], references: [id], onDelete: Cascade)
+  student   Child    @relation("Student", fields: [studentId], references: [id], onDelete: Cascade)
+
   @@id([teacherId, studentId])
   @@index([studentId])
 }
 
 model Device {
-  id          String         @id @default(cuid())
-  deviceKey   String         @unique
-  childId     String?
-  schoolId    String?
-  ownerId     String?
-  platform    DevicePlatform
-  name        String
-  model       String?
-  osVersion   String?
-  appVersion  String?
-  fcmToken    String?        @unique
-  status      DeviceStatus   @default(UNKNOWN)
-  lastSeen    DateTime?
-  isAuthorized Boolean       @default(false)
+  id               String                @id @default(cuid())
+  deviceKey        String                @unique
+  childId          String?
+  schoolId         String?
+  ownerId          String?
+  platform         DevicePlatform
+  name             String
+  model            String?
+  osVersion        String?
+  appVersion       String?
+  fcmToken         String?               @unique
+  status           DeviceStatus          @default(UNKNOWN)
+  lastSeen         DateTime?
+  isAuthorized     Boolean               @default(false)
   deviceSecretHash String?
-  batteryLevel Float?
-  isCharging Boolean @default(false)
-  storageUsed Float?
-  storageTotal Float?
-  memoryUsed Float?
-  memoryTotal Float?
-  createdAt   DateTime       @default(now())
-  updatedAt   DateTime       @updatedAt
-  child       Child?         @relation(fields: [childId], references: [id])
-  school      School?        @relation(fields: [schoolId], references: [id])
-  owner       User?          @relation(fields: [ownerId], references: [id])
-  registrations DeviceRegistration[]
-  activityEvents DeviceActivityEvent[]
-  locations DeviceLocation[]
-  screenTime ScreenTimeRecord[]
+  batteryLevel     Float?
+  isCharging       Boolean               @default(false)
+  storageUsed      Float?
+  storageTotal     Float?
+  memoryUsed       Float?
+  memoryTotal      Float?
+  createdAt        DateTime              @default(now())
+  updatedAt        DateTime              @updatedAt
+  child            Child?                @relation(fields: [childId], references: [id])
+  school           School?               @relation(fields: [schoolId], references: [id])
+  owner            User?                 @relation(fields: [ownerId], references: [id])
+  registrations    DeviceRegistration[]
+  activityEvents   DeviceActivityEvent[]
+  locations        DeviceLocation[]
+  screenTime       ScreenTimeRecord[]
+
   @@index([childId, status])
   @@index([schoolId, status])
   @@index([ownerId])
@@ -261,18 +288,20 @@ model DeviceRegistration {
   authorized Boolean  @default(false)
   createdAt  DateTime @default(now())
   device     Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
-  @@index([actorId, deviceId])
+
   @@unique([deviceId, actorId])
+  @@index([actorId, deviceId])
 }
 
 model DeviceLinkToken {
-  tokenHash String   @id
+  tokenHash String    @id
   childId   String
   actorId   String
   expiresAt DateTime
-  createdAt DateTime @default(now())
+  createdAt DateTime  @default(now())
   usedAt    DateTime?
-  deviceId  String?  @unique
+  deviceId  String?   @unique
+
   @@index([childId, expiresAt])
   @@index([actorId, createdAt])
 }
@@ -286,6 +315,7 @@ model DeviceActivityEvent {
   createdAt DateTime @default(now())
   device    Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
   child     Child    @relation(fields: [childId], references: [id], onDelete: Cascade)
+
   @@index([deviceId, createdAt])
   @@index([childId, createdAt])
   @@index([type, createdAt])
@@ -307,6 +337,7 @@ model DeviceLocation {
   createdAt DateTime @default(now())
   device    Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
   child     Child    @relation(fields: [childId], references: [id], onDelete: Cascade)
+
   @@index([childId, timestamp])
   @@index([deviceId, timestamp])
 }
@@ -323,6 +354,7 @@ model ScreenTimeRecord {
   updatedAt     DateTime @updatedAt
   device        Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
   child         Child    @relation(fields: [childId], references: [id], onDelete: Cascade)
+
   @@unique([deviceId, date])
   @@index([childId, date])
 }
@@ -340,6 +372,7 @@ model DailyUsageSummary {
   inactiveDevices Int      @default(0)
   createdAt       DateTime @default(now())
   parent          User     @relation(fields: [parentId], references: [id], onDelete: Cascade)
+
   @@unique([parentId, dayKey])
   @@index([dayKey])
 }
@@ -362,16 +395,17 @@ model Notification {
   deliveredAt    DateTime?
   recipient      User           @relation(fields: [recipientId], references: [id], onDelete: Cascade)
   child          Child?         @relation(fields: [childId], references: [id], onDelete: SetNull)
+
   @@index([recipientId, createdAt])
   @@index([recipientId, isRead])
 }
 
 model NotificationPreference {
-  userId    String   @id
-  pushEnabled Boolean @default(true)
-  types     Json     @default("{}")
-  updatedAt DateTime @updatedAt
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId      String   @id
+  pushEnabled Boolean  @default(true)
+  types       Json     @default("{}")
+  updatedAt   DateTime @updatedAt
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
 
 model AuditLog {
@@ -383,6 +417,7 @@ model AuditLog {
   details    Json     @default("{}")
   createdAt  DateTime @default(now())
   actor      User?    @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+
   @@index([actorId, createdAt])
 }
 
@@ -393,6 +428,7 @@ model LegacyRecord {
   data       Json
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
+
   @@unique([collection, sourceId])
   @@index([collection, createdAt])
 }

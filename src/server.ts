@@ -7,6 +7,7 @@ import { Prisma, PrismaClient, Role, SchoolRequestStatus } from "@prisma/client"
 import { OAuth2Client } from "google-auth-library";
 import { z } from "zod";
 import { createHash, createHmac, randomBytes, randomInt, scryptSync, timingSafeEqual } from "node:crypto";
+import { sendSendlibOtpEmail } from "./sendlib";
 
 const prisma = new PrismaClient();
 const app = express();
@@ -25,6 +26,7 @@ const firebaseClientEmail = process.env.FIREBASE_CLIENT_EMAIL || firebaseService
 const firebasePrivateKey = process.env.FIREBASE_PRIVATE_KEY || firebaseServiceAccount?.private_key;
 const resendApiKey = process.env.RESEND_API_KEY;
 const resendFromEmail = process.env.RESEND_FROM_EMAIL;
+const sendlibApiKey = process.env.SENDLIB_API_KEY;
 const otpHashSecret = process.env.OTP_HASH_SECRET;
 const authTokenSecret = process.env.AUTH_TOKEN_SECRET;
 const googleClientIds = (process.env.GOOGLE_CLIENT_IDS ?? "").split(",").map(value => value.trim()).filter(Boolean);
@@ -433,7 +435,8 @@ app.post("/api/school-invitations/claim", asyncRoute(async (req, res) => {
 app.post("/api/auth/email-otp/request", asyncRoute(async (req, res) => {
   const input = z.object({ email: z.string().email().max(254).transform(value => value.trim().toLowerCase()), fullName: z.string().trim().min(1).max(160), phone: z.string().trim().max(40).optional(), purpose: z.enum(["registration", "password_reset"]).default("registration") }).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
-  if (!resendApiKey || !resendFromEmail || !otpHashSecret || Buffer.byteLength(otpHashSecret) < 32) { res.status(503).json({ error: "Email verification is not configured" }); return; }
+  const emailProviderConfigured = input.data.purpose === "registration" ? !!sendlibApiKey : !!(resendApiKey && resendFromEmail);
+  if (!emailProviderConfigured || !otpHashSecret || Buffer.byteLength(otpHashSecret) < 32) { res.status(503).json({ error: "Email verification is not configured" }); return; }
   const { email, fullName, phone } = input.data;
   const existingUser = await prisma.user.findUnique({ where: { email }, select: { emailVerified: true, passwordHash: true } });
   if (input.data.purpose === "registration" && existingUser?.emailVerified && existingUser.passwordHash) { res.status(409).json({ error: "Email is already registered" }); return; }
@@ -462,7 +465,13 @@ app.post("/api/auth/email-otp/request", asyncRoute(async (req, res) => {
     return { sent: true };
   });
   if ("error" in result) { res.status(429).json(result); return; }
-  try { await sendEmailOtp(email, code); }
+  try {
+    if (input.data.purpose === "registration") {
+      await sendSendlibOtpEmail({ apiKey: sendlibApiKey!, email, code, name: fullName });
+    } else {
+      await sendEmailOtp(email, code);
+    }
+  }
   catch {
     await prisma.emailOtpVerification.updateMany({ where: { email, otpHash }, data: { expiresAt: new Date(0), sentAt: new Date(0), otpHash: randomBytes(32).toString("hex") } });
     res.status(503).json({ error: "Could not send the verification email. Try again shortly" }); return;
@@ -972,6 +981,84 @@ app.get("/api/me", authenticate, asyncRoute(async (req, res) => {
   res.json({ user: { ...publicUser(user), childrenIds: user.children.map(row => row.childId), studentIds: user.taught.map(row => row.studentId), parentIds: [] } });
 }));
 
+app.post("/api/me/email-otp/request", authenticate, asyncRoute(async (req, res) => {
+  const input = z.object({ email: z.string().email().max(254).transform(value => value.trim().toLowerCase()) }).safeParse(req.body);
+  if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
+  if (!sendlibApiKey || !otpHashSecret || Buffer.byteLength(otpHashSecret) < 32) { res.status(503).json({ error: "Email verification is not configured" }); return; }
+  const { id: userId, email: currentEmail } = req.principal!;
+  const email = input.data.email;
+  if (email === currentEmail.toLowerCase()) { res.status(400).json({ error: "Enter a different email address" }); return; }
+  if (await prisma.user.findUnique({ where: { email }, select: { id: true } })) { res.status(409).json({ error: "Email is already registered" }); return; }
+
+  const code = randomInt(0, 1_000_000).toString().padStart(6, "0");
+  const otpHash = hashEmailOtp(email, code);
+  const now = new Date();
+  const hourAgo = new Date(now.getTime() - 60 * 60 * 1000);
+  let result;
+  try {
+    result = await prisma.$transaction(async transaction => {
+      await transaction.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${userId}))`;
+      const current = await transaction.emailChangeVerification.findUnique({ where: { userId } });
+      const cooldownEnds = current ? current.sentAt.getTime() + 60_000 : 0;
+      if (current && current.sentAt.getTime() > now.getTime() - 60_000) return { error: "Please wait before requesting another code", retryAfterSeconds: Math.ceil((cooldownEnds - now.getTime()) / 1000) };
+      const resetWindow = !current || current.sendWindowStartedAt < hourAgo;
+      if (current && !resetWindow && current.sendsInWindow >= 5) return { error: "Too many codes requested. Try again in an hour", retryAfterSeconds: Math.ceil((current.sendWindowStartedAt.getTime() + 60 * 60 * 1000 - now.getTime()) / 1000) };
+      if (current) {
+        await transaction.emailChangeVerification.update({ where: { userId }, data: { email, otpHash, attempts: 0, sentAt: now, expiresAt: new Date(now.getTime() + 10 * 60_000), sendsInWindow: resetWindow ? 1 : { increment: 1 }, sendWindowStartedAt: resetWindow ? now : current.sendWindowStartedAt } });
+      } else {
+        await transaction.emailChangeVerification.create({ data: { userId, email, otpHash, attempts: 0, sendsInWindow: 1, sendWindowStartedAt: now, sentAt: now, expiresAt: new Date(now.getTime() + 10 * 60_000) } });
+      }
+      return { sent: true };
+    });
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") { res.status(409).json({ error: "Email is already registered or a verification is pending" }); return; }
+    throw error;
+  }
+  if ("error" in result) { res.status(429).json(result); return; }
+  try {
+    await sendSendlibOtpEmail({ apiKey: sendlibApiKey, email, code, name: req.principal!.fullName });
+  } catch {
+    await prisma.emailChangeVerification.updateMany({ where: { userId, email, otpHash }, data: { expiresAt: new Date(0), sentAt: new Date(0), otpHash: randomBytes(32).toString("hex") } });
+    res.status(503).json({ error: "Could not send the verification email. Try again shortly" }); return;
+  }
+  res.status(202).json({ sent: true, expiresInSeconds: 600, resendAfterSeconds: 60 });
+}));
+
+app.post("/api/me/email-otp/verify", authenticate, asyncRoute(async (req, res) => {
+  const input = z.object({ email: z.string().email().max(254).transform(value => value.trim().toLowerCase()), code: z.string().regex(/^\d{6}$/) }).safeParse(req.body);
+  if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
+  const { id: userId } = req.principal!;
+  const { email, code } = input.data;
+  const now = new Date();
+  let result;
+  try {
+    result = await prisma.$transaction(async transaction => {
+      await transaction.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${userId}))`;
+      const current = await transaction.emailChangeVerification.findUnique({ where: { userId } });
+      if (!current || current.email !== email || current.expiresAt <= now) return { error: "Verification code is invalid or expired", status: 410 };
+      if (current.attempts >= 5) return { error: "Too many incorrect codes. Request a new one", status: 429 };
+      const suppliedHash = Buffer.from(hashEmailOtp(email, code), "hex");
+      const storedHash = Buffer.from(current.otpHash, "hex");
+      if (suppliedHash.length !== storedHash.length || !timingSafeEqual(suppliedHash, storedHash)) {
+        const attempts = current.attempts + 1;
+        await transaction.emailChangeVerification.update({ where: { userId }, data: { attempts } });
+        return { error: attempts >= 5 ? "Too many incorrect codes. Request a new one" : "Incorrect verification code", status: attempts >= 5 ? 429 : 400 };
+      }
+      const collision = await transaction.user.findUnique({ where: { email }, select: { id: true } });
+      if (collision && collision.id !== userId) return { error: "Email is already registered", status: 409 };
+      const user = await transaction.user.update({ where: { id: userId }, data: { email, emailVerified: true } });
+      await transaction.emailChangeVerification.delete({ where: { userId } });
+      await transaction.auditLog.create({ data: { actorId: userId, action: "user.email_changed", entityType: "user", entityId: userId } });
+      return { user };
+    });
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") { res.status(409).json({ error: "Email is already registered" }); return; }
+    throw error;
+  }
+  if ("error" in result) { res.status(result.status ?? 400).json({ error: result.error }); return; }
+  res.json({ verified: true, user: publicUser(result.user) });
+}));
+
 app.patch("/api/me", authenticate, asyncRoute(async (req, res) => {
   const input = z.object({ fullName: z.string().trim().min(1).max(160).optional(), phone: z.string().max(40).nullable().optional(), profileImageUrl: z.string().url().nullable().optional(), preferences: z.record(z.unknown()).optional(), isPremium: z.boolean().optional(), premiumExpiry: z.string().datetime().nullable().optional() }).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
@@ -988,6 +1075,8 @@ app.delete("/api/me", authenticate, asyncRoute(async (req, res) => {
   await prisma.$transaction(async transaction => {
     await transaction.deletedAuthIdentity.upsert({ where: { firebaseUidHash }, create: { firebaseUidHash }, update: {} });
     await transaction.emailOtpVerification.deleteMany({ where: { email: req.principal!.email.toLowerCase() } });
+    // Remove the migrated Firestore account snapshot for this identity as well.
+    await transaction.legacyRecord.deleteMany({ where: { collection: "users_unmapped", sourceId: firebaseUid } });
 
     const registrations = await transaction.deviceRegistration.findMany({ where: { actorId: id }, select: { deviceId: true } });
     await transaction.deviceRegistration.deleteMany({ where: { actorId: id } });
@@ -1003,8 +1092,12 @@ app.delete("/api/me", authenticate, asyncRoute(async (req, res) => {
       if (!device.childId) {
         await transaction.device.delete({ where: { id: device.id } });
       } else if (otherAuthorizedRegistration) {
-        await transaction.device.update({ where: { id: device.id }, data: { ownerId: null } });
+        await transaction.device.update({ where: { id: device.id }, data: { ownerId: null, fcmToken: null } });
       } else {
+        // Monitoring history belongs to this parent's now-unshared device link.
+        await transaction.deviceActivityEvent.deleteMany({ where: { deviceId: device.id } });
+        await transaction.deviceLocation.deleteMany({ where: { deviceId: device.id } });
+        await transaction.screenTimeRecord.deleteMany({ where: { deviceId: device.id } });
         await transaction.device.update({ where: { id: device.id }, data: { ownerId: null, isAuthorized: false, status: "OFFLINE", fcmToken: null, deviceSecretHash: null } });
       }
     }
@@ -1236,18 +1329,64 @@ app.post("/api/device-events", asyncRoute(async (req, res) => {
   const expectedHash = Buffer.from(device.deviceSecretHash, "hex");
   if (actualHash.length !== expectedHash.length || !timingSafeEqual(actualHash, expectedHash)) { res.status(403).json({ error: "Device credentials are invalid" }); return; }
   const createdAt = new Date();
+  let storedPayload = event.payload as Record<string, unknown>;
+  let riskCategory: string | undefined;
+  let riskSeverity: string | undefined;
+  let riskDedupKey: string | undefined;
+  if (event.type === "blocked_content" && typeof event.payload.riskCategory === "string") {
+    const category = z.enum(["self_harm", "threat", "bullying", "unsafe_content"]).safeParse(event.payload.riskCategory);
+    const severity = z.enum(["low", "medium", "high", "urgent"]).safeParse(event.payload.riskSeverity);
+    const dedupKey = z.string().regex(/^[a-f0-9]{64}$/).safeParse(event.payload.dedupKey);
+    if (!category.success || !severity.success || !dedupKey.success) { res.status(400).json({ error: "Invalid risk event metadata" }); return; }
+    riskCategory = category.data;
+    riskSeverity = severity.data;
+    riskDedupKey = dedupKey.data;
+    const duplicate = await prisma.deviceActivityEvent.findFirst({
+      where: { deviceId: device.id, type: "blocked_content", createdAt: { gte: new Date(createdAt.getTime() - 15 * 60 * 1000) }, payload: { path: ["dedupKey"], equals: riskDedupKey } },
+      select: { id: true },
+    });
+    if (duplicate) { res.status(202).json({ accepted: true, duplicate: true }); return; }
+    if (riskSeverity === "medium" || riskSeverity === "low") {
+      const recentAlerts = await prisma.deviceActivityEvent.count({
+        where: { deviceId: device.id, type: "blocked_content", createdAt: { gte: new Date(createdAt.getTime() - 60 * 1000) } },
+      });
+      if (recentAlerts >= 5) { res.status(202).json({ accepted: false, rateLimited: true }); return; }
+    }
+    const ruleIds = Array.isArray(event.payload.ruleIds)
+      ? event.payload.ruleIds.filter((value): value is string => typeof value === "string").slice(0, 5).map(value => value.slice(0, 80))
+      : [];
+    const packageName = typeof event.payload.packageName === "string" ? event.payload.packageName.slice(0, 180) : "";
+    const explanation = typeof event.payload.explanation === "string" ? event.payload.explanation.slice(0, 240) : "Possible safety concern; review context in the app.";
+    // New clients send only classified metadata. Strip raw screen text and arbitrary payload keys.
+    storedPayload = { riskCategory, riskSeverity, ruleIds, packageName, explanation, dedupKey: riskDedupKey, retentionClass: "monitoring_event_v1" };
+  } else if (event.type === "blocked_content") {
+    // Keep the old alert contract while ignoring its optional screen excerpt and unknown fields.
+    storedPayload = {
+      ...(typeof event.payload.deviceName === "string" ? { deviceName: event.payload.deviceName.slice(0, 120) } : {}),
+      ...(typeof event.payload.blockedTerm === "string" ? { blockedTerm: event.payload.blockedTerm.slice(0, 160) } : {}),
+      ...(typeof event.payload.packageName === "string" ? { packageName: event.payload.packageName.slice(0, 180) } : {}),
+      retentionClass: "monitoring_event_v1",
+    };
+  }
   await prisma.$transaction([
-    prisma.deviceActivityEvent.create({ data: { deviceId: device.id, childId: device.childId, type: event.type, payload: event.payload as Prisma.InputJsonValue, createdAt } }),
+    prisma.deviceActivityEvent.create({ data: { deviceId: device.id, childId: device.childId, type: event.type, payload: storedPayload as Prisma.InputJsonValue, createdAt } }),
     prisma.device.update({ where: { id: device.id }, data: { status: event.type === "tamper_event" ? "UNKNOWN" : "ONLINE", lastSeen: createdAt, model: z.string().max(120).optional().parse(event.payload.deviceModel) ?? device.model, osVersion: z.string().max(120).optional().parse(event.payload.osVersion) ?? device.osVersion } }),
   ]);
   if (event.type === "blocked_content" || event.type === "tamper_event") {
     const parent = await prisma.user.findUnique({ where: { id: device.ownerId }, select: { isActive: true } });
     if (parent?.isActive) {
-      const blockedTerm = typeof event.payload.blockedTerm === "string" ? event.payload.blockedTerm.slice(0, 160) : "unsafe content";
-      const title = event.type === "blocked_content" ? "Unsafe content blocked" : "Child device protection alert";
-      const body = event.type === "blocked_content" ? `${device.name} blocked: ${blockedTerm}` : `${device.name}: ${typeof event.payload.message === "string" ? event.payload.message.slice(0, 300) : "Protection status changed."}`;
-      const notification = await prisma.notification.create({ data: { recipientId: device.ownerId, childId: device.childId, title, body, type: event.type === "tamper_event" ? "behavior" : "system", relatedEntity: "device_activity", relatedId: device.id, payload: { source: event.type, deviceId: device.id, childId: device.childId, blockedTerm } } });
-      await deliver(notification.id, device.ownerId, title, body, { source: event.type, deviceId: device.id, childId: device.childId, blockedTerm });
+      const legacyBlockedTerm = typeof event.payload.blockedTerm === "string" ? event.payload.blockedTerm.slice(0, 160) : "unsafe content";
+      const categoryLabels: Record<string, string> = { self_harm: "possible self-harm indicator", threat: "possible threat", bullying: "possible bullying", unsafe_content: "unsafe content" };
+      const isClassifiedRisk = !!riskCategory && !!riskSeverity;
+      const title = event.type === "tamper_event" ? "Child device protection alert" : riskCategory === "unsafe_content" || (!isClassifiedRisk && event.type === "blocked_content") ? "Unsafe content blocked" : "Possible child safety concern";
+      const body = event.type === "tamper_event"
+        ? `${device.name}: ${typeof event.payload.message === "string" ? event.payload.message.slice(0, 300) : "Protection status changed."}`
+        : isClassifiedRisk
+          ? `${device.name}: a ${categoryLabels[riskCategory!] ?? "safety"} phrase matched (${riskSeverity} signal). Review the context in KidGuard.`
+          : `${device.name} blocked: ${legacyBlockedTerm}`;
+      const notificationPayload = { source: event.type, deviceId: device.id, childId: device.childId, ...(event.type === "blocked_content" ? { retentionClass: "monitoring_event_v1" } : {}), ...(isClassifiedRisk ? { riskCategory, riskSeverity } : { blockedTerm: legacyBlockedTerm }) };
+      const notification = await prisma.notification.create({ data: { recipientId: device.ownerId, childId: device.childId, title, body, type: event.type === "tamper_event" || (riskCategory && riskCategory !== "unsafe_content") ? "behavior" : "system", relatedEntity: "device_activity", relatedId: device.id, payload: notificationPayload } });
+      await deliver(notification.id, device.ownerId, title, body, notificationPayload);
     }
   }
   res.status(202).json({ accepted: true });
@@ -1372,6 +1511,11 @@ app.post("/api/devices/push-token", authenticate, asyncRoute(async (req, res) =>
   res.json({ id: device.id });
 }));
 
+app.delete("/api/devices/push-token", authenticate, asyncRoute(async (req, res) => {
+  const result = await prisma.device.updateMany({ where: { ownerId: req.principal!.id, childId: null, fcmToken: { not: null } }, data: { fcmToken: null, status: "OFFLINE" } });
+  res.json({ unregistered: result.count });
+}));
+
 app.post("/api/devices/register", authenticate, asyncRoute(async (req, res) => {
   const input = z.object({ deviceKey: z.string().min(1).max(200), childId: z.string().min(1), platform: z.enum(["ANDROID", "IOS", "WINDOWS", "MACOS", "WEB"]), name: z.string().min(1).max(120), model: z.string().max(120).optional(), osVersion: z.string().max(120).optional(), appVersion: z.string().max(80).optional(), fcmToken: z.string().optional() }).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
@@ -1408,7 +1552,21 @@ app.get("/api/devices", authenticate, asyncRoute(async (req, res) => {
       ? { OR: [{ ownerId: user.id }, { child: { parents: { some: { parentId: user.id } } } }] }
       : { OR: [{ ownerId: user.id }, { child: { teachers: { some: { teacherId: user.id } } } }] };
   const devices = await prisma.device.findMany({ where, orderBy: { updatedAt: "desc" } });
-  res.json({ devices: devices.map(({ fcmToken: _token, deviceKey: _deviceKey, deviceSecretHash: _secret, ...device }) => ({ ...device, userId: device.childId ?? device.ownerId, deviceName: device.name, type: device.platform.toLowerCase(), deviceModel: device.model, isActive: device.isAuthorized, canDelete: device.ownerId === user.id || (user.role === Role.ADMIN && (!user.schoolId || device.schoolId === user.schoolId)) })) });
+  const childDeviceIds = devices.filter(device => device.childId).map(device => device.id);
+  const heartbeatCutoff = new Date(Date.now() - 35 * 60 * 1000);
+  const recentHeartbeats = childDeviceIds.length ? await prisma.deviceActivityEvent.findMany({
+    where: { deviceId: { in: childDeviceIds }, type: "device_heartbeat", createdAt: { gte: heartbeatCutoff } },
+    orderBy: { createdAt: "desc" },
+    take: childDeviceIds.length * 3,
+    select: { deviceId: true, payload: true, createdAt: true },
+  }) : [];
+  const latestMonitoringHeartbeat = new Map<string, { active: boolean; at: Date }>();
+  for (const heartbeat of recentHeartbeats) {
+    if (latestMonitoringHeartbeat.has(heartbeat.deviceId)) continue;
+    const payload = heartbeat.payload as Record<string, unknown>;
+    latestMonitoringHeartbeat.set(heartbeat.deviceId, { active: payload.monitoringActive === true && payload.accessibilityActive === true && payload.usageAccessActive === true, at: heartbeat.createdAt });
+  }
+  res.json({ devices: devices.map(({ fcmToken: _token, deviceKey: _deviceKey, deviceSecretHash: _secret, ...device }) => ({ ...device, userId: device.childId ?? device.ownerId, deviceName: device.name, type: device.platform.toLowerCase(), deviceModel: device.model, isActive: device.isAuthorized, canDelete: device.ownerId === user.id || (user.role === Role.ADMIN && (!user.schoolId || device.schoolId === user.schoolId)), monitoringActive: device.childId ? latestMonitoringHeartbeat.get(device.id)?.active === true : null, monitoringHeartbeatAt: device.childId ? latestMonitoringHeartbeat.get(device.id)?.at.toISOString() ?? null : null })) });
 }));
 
 app.get("/api/devices/:deviceId", authenticate, asyncRoute(async (req, res) => {
@@ -1508,14 +1666,20 @@ async function deliver(id: string, recipientId: string, title: string, body: str
     await prisma.notification.update({ where: { id }, data: { deliveryStatus: "SKIPPED" } });
     return;
   }
-  const tokens = (await prisma.device.findMany({ where: { ownerId: recipientId, fcmToken: { not: null } }, select: { fcmToken: true } })).map(d => d.fcmToken!).filter(Boolean);
+  const tokens = (await prisma.device.findMany({ where: { ownerId: recipientId, childId: null, fcmToken: { not: null } }, select: { fcmToken: true } })).map(d => d.fcmToken!).filter(Boolean);
   if (!tokens.length || !getApps().length) return;
   try {
     const { getMessaging } = await import("firebase-admin/messaging");
     const response = await getMessaging().sendEachForMulticast({ tokens, notification: { title, body }, data: { notificationId: id, ...Object.fromEntries(Object.entries(payload).map(([key, value]) => [key, typeof value === "string" ? value : JSON.stringify(value)])) } });
+    const invalidTokens = response.responses.flatMap((result, index) => {
+      const code = result.error?.code;
+      return !result.success && (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token") ? [tokens[index]] : [];
+    });
+    if (invalidTokens.length) await prisma.device.updateMany({ where: { fcmToken: { in: invalidTokens } }, data: { fcmToken: null } });
     await prisma.notification.update({ where: { id }, data: { deliveryStatus: response.successCount ? "SENT" : "FAILED", deliveryError: response.failureCount ? `${response.failureCount} device(s) failed` : null, deliveredAt: response.successCount ? new Date() : null } });
   } catch (error) {
-    await prisma.notification.update({ where: { id }, data: { deliveryStatus: "FAILED", deliveryError: error instanceof Error ? error.message.slice(0, 500) : "FCM delivery failed" } });
+    const code = error && typeof error === "object" && "code" in error && typeof error.code === "string" ? error.code : "fcm_delivery_failed";
+    await prisma.notification.update({ where: { id }, data: { deliveryStatus: "FAILED", deliveryError: code.slice(0, 120) } });
   }
 }
 
@@ -1601,5 +1765,18 @@ async function createDailyUsageSummaries() {
 const port = Number(process.env.PORT) || 8080;
 const server = app.listen(port, () => console.log(`KidGuard API listening on ${port}`));
 const dailySummaryTimer = setInterval(() => { void createDailyUsageSummaries().catch(error => console.error("Daily usage summary job failed", error)); }, 15 * 60 * 1000);
+const monitoringRetentionTimer = setInterval(() => { void pruneExpiredMonitoringData().catch(() => console.error("Monitoring retention job failed")); }, 24 * 60 * 60 * 1000);
+async function pruneExpiredMonitoringData() {
+  const cutoff = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
+  // Only records explicitly tagged by the privacy-first event contract are pruned.
+  // Older imported/legacy records remain untouched pending a separate retention decision.
+  await prisma.deviceActivityEvent.deleteMany({
+    where: { createdAt: { lt: cutoff }, payload: { path: ["retentionClass"], equals: "monitoring_event_v1" } },
+  });
+  await prisma.notification.deleteMany({
+    where: { createdAt: { lt: cutoff }, payload: { path: ["retentionClass"], equals: "monitoring_event_v1" } },
+  });
+}
+void pruneExpiredMonitoringData().catch(() => console.error("Monitoring retention job failed"));
 void createDailyUsageSummaries().catch(error => console.error("Daily usage summary job failed", error));
-for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => server.close(() => { clearInterval(dailySummaryTimer); void prisma.$disconnect().finally(() => process.exit(0)); }));
+for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => server.close(() => { clearInterval(dailySummaryTimer); clearInterval(monitoringRetentionTimer); void prisma.$disconnect().finally(() => process.exit(0)); }));
