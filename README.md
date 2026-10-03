@@ -16,6 +16,7 @@ Configure `RESEND_API_KEY`, `RESEND_FROM_EMAIL` (on a verified Resend domain), a
 
 `POST /api/children` registers child records without creating child accounts. `GET /api/children` returns only the authenticated user's permitted scope. Admin school/class routes and `/api/admin/children/:childId/teachers` enforce the assigned school at the API layer.
 
+
 ## One-time platform administrator bootstrap
 
 To create or promote the global platform administrator, run this one-time command in the deployed backend's Render Shell after Prisma migrations have completed. It creates a PostgreSQL account with `ADMIN` role and no school scope, stores a scrypt password hash, and writes an audit entry. If the email already exists, it updates that account's name, password, and role. The password must be unique and at least 10 characters; do not put it in source code or commit it.
@@ -23,12 +24,11 @@ To create or promote the global platform administrator, run this one-time comman
 ```bash
 export ADMIN_BOOTSTRAP_EMAIL="admin@example.com"
 read -r -s -p "New admin password: " ADMIN_BOOTSTRAP_PASSWORD
-printf '\n'
+printf '\\n'
 export ADMIN_BOOTSTRAP_PASSWORD
 npm run admin:bootstrap
 unset ADMIN_BOOTSTRAP_EMAIL ADMIN_BOOTSTRAP_PASSWORD
 ```
-
 ## Existing Firestore data import
 
 The importer is idempotent. It migrates schools and classes, authenticated user roles, child profiles and parent/teacher relationships, devices and registration credentials, push tokens, notification history and read state. Unsupported top-level collections and unclassified users are preserved in `LegacyRecord` instead of being discarded.
