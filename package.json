@@ -13,7 +13,8 @@
     "prisma:migrate:deploy": "prisma migrate deploy",
     "start:render": "prisma migrate deploy && node dist/server.js",
     "migrate:firestore": "tsx scripts/migrate-firestore.ts",
-    "migrate:firebase-auth": "tsx scripts/migrate-firebase-auth.ts"
+    "migrate:firebase-auth": "tsx scripts/migrate-firebase-auth.ts",
+    "admin:bootstrap": "tsx scripts/bootstrap-admin.ts"
   },
   "dependencies": {
     "@prisma/client": "^6.19.0",
