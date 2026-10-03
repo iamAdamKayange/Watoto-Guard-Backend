@@ -3,16 +3,18 @@ import cors from "cors";
 import express, { NextFunction, Request, Response } from "express";
 import helmet from "helmet";
 import { cert, getApps, initializeApp } from "firebase-admin/app";
-import { getAuth } from "firebase-admin/auth";
-import { Prisma, PrismaClient, Role } from "@prisma/client";
+import { Prisma, PrismaClient, Role, SchoolRequestStatus } from "@prisma/client";
+import { OAuth2Client } from "google-auth-library";
 import { z } from "zod";
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomInt, scryptSync, timingSafeEqual } from "node:crypto";
 
 const prisma = new PrismaClient();
 const app = express();
 app.disable("x-powered-by");
 app.use(helmet());
-app.use(cors({ origin: process.env.CORS_ORIGINS?.split(",").filter(Boolean) ?? true }));
+const configuredCorsOrigins = (process.env.CORS_ORIGINS ?? "").split(",").map(origin => origin.trim()).filter(Boolean);
+const corsOrigins = [...new Set([...configuredCorsOrigins, "https://kidguard-admin-site.vercel.app"])];
+app.use(cors({ origin: process.env.CORS_ORIGINS === undefined ? true : corsOrigins }));
 app.use(express.json({ limit: "256kb" }));
 
 const firebaseServiceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
@@ -21,6 +23,11 @@ const firebaseServiceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
 const firebaseProjectId = process.env.FIREBASE_PROJECT_ID || firebaseServiceAccount?.project_id;
 const firebaseClientEmail = process.env.FIREBASE_CLIENT_EMAIL || firebaseServiceAccount?.client_email;
 const firebasePrivateKey = process.env.FIREBASE_PRIVATE_KEY || firebaseServiceAccount?.private_key;
+const resendApiKey = process.env.RESEND_API_KEY;
+const resendFromEmail = process.env.RESEND_FROM_EMAIL;
+const otpHashSecret = process.env.OTP_HASH_SECRET;
+const authTokenSecret = process.env.AUTH_TOKEN_SECRET;
+const googleClientIds = (process.env.GOOGLE_CLIENT_IDS ?? "").split(",").map(value => value.trim()).filter(Boolean);
 
 if (!getApps().length && firebaseProjectId && firebaseClientEmail && firebasePrivateKey) {
   initializeApp({ credential: cert({
@@ -33,8 +40,8 @@ if (!getApps().length && firebaseProjectId && firebaseClientEmail && firebasePri
 type Principal = { id: string; firebaseUid: string; role: Role; schoolId: string | null; fullName: string; email: string };
 declare global { namespace Express { interface Request { principal?: Principal } } }
 
-function publicUser<T extends { id: string; firebaseUid: string }>(row: T) {
-  const { id, firebaseUid: _firebaseUid, ...data } = row;
+function publicUser<T extends { id: string; firebaseUid: string; passwordHash?: string | null }>(row: T) {
+  const { id, firebaseUid: _firebaseUid, passwordHash: _passwordHash, ...data } = row;
   return { ...data, id: row.firebaseUid, databaseId: id };
 }
 
@@ -44,13 +51,18 @@ function asyncRoute(handler: (req: Request, res: Response) => Promise<unknown>) 
 
 const authenticate = (req: Request, res: Response, next: NextFunction) => {
   void (async () => {
-    if (!getApps().length) { res.status(503).json({ error: "Authentication service is not configured" }); return; }
+    if (!authTokenSecret || Buffer.byteLength(authTokenSecret) < 32) { res.status(503).json({ error: "PostgreSQL authentication is not configured" }); return; }
     const token = req.header("authorization")?.match(/^Bearer (.+)$/i)?.[1];
     if (!token) { res.status(401).json({ error: "Bearer token required" }); return; }
     try {
-      const decoded = await getAuth().verifyIdToken(token);
-      const user = await prisma.user.findUnique({ where: { firebaseUid: decoded.uid } });
-      if (!user || !user.isActive) { res.status(403).json({ error: "Account is not provisioned" }); return; }
+      const userId = verifyAccessToken(token);
+      if (!userId) { res.status(401).json({ error: "Invalid or expired token" }); return; }
+      const user = await prisma.user.findUnique({ where: { id: userId } });
+      if (!user || !user.isActive) { res.status(403).json({ error: "Account is not active" }); return; }
+      if (user.schoolId) {
+        const school = await prisma.school.findUnique({ where: { id: user.schoolId }, select: { isActive: true } });
+        if (!school?.isActive) { res.status(403).json({ error: "School access is suspended" }); return; }
+      }
       req.principal = user;
       next();
     } catch { res.status(401).json({ error: "Invalid or expired token" }); }
@@ -64,6 +76,50 @@ function allow(...roles: Role[]) {
   };
 }
 
+function signAccessToken(userId: string) {
+  if (!authTokenSecret || Buffer.byteLength(authTokenSecret) < 32) throw new Error("AUTH_TOKEN_SECRET must contain at least 32 bytes");
+  const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
+  const payload = Buffer.from(JSON.stringify({ sub: userId, iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60 })).toString("base64url");
+  const unsigned = `${header}.${payload}`;
+  return `${unsigned}.${createHmac("sha256", authTokenSecret).update(unsigned).digest("base64url")}`;
+}
+
+function verifyAccessToken(token: string): string | null {
+  if (!authTokenSecret || Buffer.byteLength(authTokenSecret) < 32) return null;
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  const unsigned = `${parts[0]}.${parts[1]}`;
+  const expected = createHmac("sha256", authTokenSecret).update(unsigned).digest();
+  let supplied: Buffer;
+  try { supplied = Buffer.from(parts[2], "base64url"); } catch { return null; }
+  if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as { sub?: unknown; exp?: unknown };
+    return typeof payload.sub === "string" && typeof payload.exp === "number" && payload.exp > Date.now() / 1000 ? payload.sub : null;
+  } catch { return null; }
+}
+
+function hashPassword(password: string) {
+  const salt = randomBytes(16).toString("base64url");
+  return `${salt}:${scryptSync(password, salt, 64).toString("base64url")}`;
+}
+
+function verifyPassword(password: string, encoded: string) {
+  const [salt, hash] = encoded.split(":");
+  if (!salt || !hash) return false;
+  const expected = Buffer.from(hash, "base64url");
+  const actual = scryptSync(password, salt, expected.length);
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+
+function requirePlatformAdmin(req: Request, res: Response, next: NextFunction) {
+  if (!req.principal || req.principal.role !== Role.ADMIN || req.principal.schoolId !== null) {
+    res.status(403).json({ error: "Platform administrator access required" });
+    return;
+  }
+  next();
+}
+
 async function canAccessChild(user: Principal, childId: string) {
   if (user.role === Role.ADMIN) {
     const child = await prisma.child.findUnique({ where: { id: childId }, select: { schoolId: true } });
@@ -73,6 +129,474 @@ async function canAccessChild(user: Principal, childId: string) {
   return !!await prisma.teacherStudent.findUnique({ where: { teacherId_studentId: { teacherId: user.id, studentId: childId } } });
 }
 
+const legacyCollections = new Set(["announcements", "attendance", "behavior_reports", "homework", "homework_submissions", "feedback", "results", "subscriptions", "link_requests"]);
+
+function objectData(value: Prisma.JsonValue): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+async function legacyScope(user: Principal) {
+  const links = user.role === Role.PARENT
+    ? await prisma.parentChild.findMany({ where: { parentId: user.id }, include: { child: { select: { id: true, schoolId: true, classId: true } } } })
+    : user.role === Role.TEACHER
+      ? await prisma.teacherStudent.findMany({ where: { teacherId: user.id }, include: { student: { select: { id: true, schoolId: true, classId: true } } } })
+      : [];
+  const children = links.map(link => "child" in link ? link.child : link.student);
+  return {
+    childIds: new Set(children.map(child => child.id)),
+    classIds: new Set(children.flatMap(child => child.classId ? [child.classId] : [])),
+    schoolIds: new Set([...(user.schoolId ? [user.schoolId] : []), ...children.flatMap(child => child.schoolId ? [child.schoolId] : [])]),
+    identityIds: new Set([user.id, user.firebaseUid]),
+  };
+}
+
+function legacyOwner(data: Record<string, unknown>, userId: string) {
+  return ["teacherId", "authorId", "createdBy", "userId", "parentId", "submittedBy", "reviewedBy"].some(key => data[key] === userId);
+}
+
+async function canReadLegacy(user: Principal, collection: string, data: Record<string, unknown>, scope: Awaited<ReturnType<typeof legacyScope>>) {
+  if (user.role === Role.ADMIN) return !user.schoolId || data.schoolId === user.schoolId || !data.schoolId;
+  if (legacyOwner(data, user.firebaseUid) || legacyOwner(data, user.id)) return true;
+  if (collection === "announcements") {
+    if (typeof data.schoolId !== "string" || !scope.schoolIds.has(data.schoolId)) return false;
+    const roles = Array.isArray(data.targetRoles) ? data.targetRoles.map(String) : ["all"];
+    return roles.some(role => [user.role.toLowerCase(), `${user.role.toLowerCase()}s`, "all", "everyone"].includes(role.toLowerCase()));
+  }
+  if (collection === "results" && user.role === Role.PARENT && data.isPublished !== true) return false;
+  const childId = data.studentId ?? data.childId;
+  if (typeof childId === "string") return scope.childIds.has(childId);
+  if (typeof data.classId === "string") return scope.classIds.has(data.classId) && (typeof data.schoolId !== "string" || scope.schoolIds.has(data.schoolId));
+  return typeof data.schoolId === "string" && scope.schoolIds.has(data.schoolId);
+}
+
+async function canWriteLegacy(user: Principal, collection: string, data: Record<string, unknown>, scope: Awaited<ReturnType<typeof legacyScope>>) {
+  if (user.role === Role.ADMIN) return !user.schoolId || data.schoolId === user.schoolId;
+  if (user.role === Role.TEACHER && ["announcements", "attendance", "behavior_reports", "homework", "results"].includes(collection)) {
+    if (data.schoolId !== user.schoolId) return false;
+    const studentId = data.studentId ?? data.childId;
+    if (typeof studentId === "string") return scope.childIds.has(studentId);
+    if (typeof data.classId === "string") return scope.classIds.has(data.classId);
+    return collection === "announcements" || collection === "homework";
+  }
+  if (user.role === Role.PARENT && ["feedback", "homework_submissions", "subscriptions"].includes(collection)) {
+    const studentId = data.studentId ?? data.childId;
+    return typeof studentId === "string" ? scope.childIds.has(studentId) : collection !== "homework_submissions";
+  }
+  return false;
+}
+
+function hashEmailOtp(email: string, code: string) {
+  if (!otpHashSecret) throw new Error("OTP_HASH_SECRET is not configured");
+  return createHmac("sha256", otpHashSecret).update(`${email}:${code}`).digest("hex");
+}
+
+async function sendEmailOtp(email: string, code: string) {
+  if (!resendApiKey || !resendFromEmail) throw new Error("Resend is not configured");
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    signal: AbortSignal.timeout(10_000),
+    headers: { Authorization: `Bearer ${resendApiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      from: resendFromEmail,
+      to: [email],
+      subject: "KidGuard email verification code",
+      text: `Your KidGuard verification code is ${code}. It expires in 10 minutes. If you did not request this code, ignore this email.`,
+      html: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:28px;color:#112442"><h2>Verify your KidGuard email</h2><p>Enter this code in the app to finish creating your account:</p><p style="font-size:32px;letter-spacing:8px;font-weight:bold;color:#1769e0">${code}</p><p>This code expires in 10 minutes. If you did not request it, ignore this email.</p></div>`,
+    }),
+  });
+  if (!response.ok) {
+    console.error("Resend email request failed", response.status);
+    throw new Error("Verification email could not be sent");
+  }
+}
+
+async function sendTransactionalEmail(email: string, subject: string, text: string, html: string) {
+  if (!resendApiKey || !resendFromEmail) throw new Error("Resend is not configured");
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    signal: AbortSignal.timeout(10_000),
+    headers: { Authorization: `Bearer ${resendApiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ from: resendFromEmail, to: [email], subject, text, html }),
+  });
+  if (!response.ok) {
+    console.error("Resend transactional email failed", response.status);
+    throw new Error("Email could not be sent");
+  }
+}
+
+function createInvitationToken() {
+  const token = randomBytes(32).toString("base64url");
+  return { token, tokenHash: createHash("sha256").update(token).digest("hex") };
+}
+
+function escapeHtml(value: string) {
+  return value.replace(/[&<>"']/g, character => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" })[character]!);
+}
+
+async function emailSchoolInvitation(email: string, schoolName: string, role: Role, token: string) {
+  const roleLabel = role === Role.ADMIN ? "school administrator" : "teacher";
+  const safeSchoolName = escapeHtml(schoolName);
+  const subject = `Invitation to join ${schoolName} on KidGuard`;
+  const text = `You have been invited to join ${schoolName} on KidGuard as a ${roleLabel}. Open KidGuard, choose Join with school invitation, and enter this one-time code: ${token}. The code expires in 7 days. If you were not expecting this invitation, ignore this email.`;
+  const html = `<div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;padding:28px;color:#112442"><h2>Join ${safeSchoolName} on KidGuard</h2><p>You were invited as a ${roleLabel}. In KidGuard, choose <b>Join with school invitation</b> and enter this one-time code:</p><p style="font-size:20px;letter-spacing:2px;font-weight:bold;word-break:break-all;color:#1769e0">${token}</p><p>This invitation expires in 7 days. Ignore this email if you were not expecting it.</p></div>`;
+  await sendTransactionalEmail(email, subject, text, html);
+}
+
+app.post("/api/school-access-requests", asyncRoute(async (req, res) => {
+  const input = z.object({
+    contactName: z.string().trim().min(2).max(160),
+    email: z.string().trim().email().max(254).transform(value => value.toLowerCase()),
+    phone: z.string().trim().min(6).max(40),
+    position: z.string().trim().min(2).max(100),
+    schoolName: z.string().trim().min(2).max(160),
+    schoolAddress: z.string().trim().min(2).max(300),
+    website: z.string().trim().url().max(300).optional().or(z.literal("")),
+    studentCount: z.number().int().positive().max(100_000).optional(),
+    message: z.string().trim().max(2000).optional(),
+  }).safeParse(req.body);
+  if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
+  const email = input.data.email;
+  const recentRequest = await prisma.schoolAccessRequest.findFirst({
+    where: { email, status: SchoolRequestStatus.PENDING, createdAt: { gt: new Date(Date.now() - 24 * 60 * 60_000) } },
+    select: { id: true },
+  });
+  if (recentRequest) { res.status(429).json({ error: "A request for this email is already being reviewed" }); return; }
+  const request = await prisma.schoolAccessRequest.create({ data: {
+    ...input.data,
+    website: input.data.website || null,
+  } });
+  res.status(201).json({ requestId: request.id, status: request.status, message: "Ombi limepokelewa. Timu yetu itawasiliana nawe baada ya kulikagua." });
+}));
+
+app.get("/api/admin/school-access-requests", authenticate, allow(Role.ADMIN), asyncRoute(async (req, res) => {
+  if (req.principal!.schoolId) { res.status(403).json({ error: "Only platform administrators can review school requests" }); return; }
+  const status = typeof req.query.status === "string" && ["PENDING", "APPROVED", "REJECTED"].includes(req.query.status)
+    ? req.query.status as SchoolRequestStatus
+    : SchoolRequestStatus.PENDING;
+  const requests = await prisma.schoolAccessRequest.findMany({
+    where: { status }, orderBy: { createdAt: "asc" },
+    include: { school: { select: { id: true, name: true } } },
+  });
+  res.json({ requests });
+}));
+
+app.post("/api/admin/school-access-requests/:requestId/decision", authenticate, allow(Role.ADMIN), asyncRoute(async (req, res) => {
+  if (req.principal!.schoolId) { res.status(403).json({ error: "Only platform administrators can review school requests" }); return; }
+  const requestId = req.params.requestId.toString();
+  const input = z.object({ decision: z.enum(["approve", "reject"]), reviewNote: z.string().trim().max(1000).optional() }).safeParse(req.body);
+  if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
+  const request = await prisma.schoolAccessRequest.findUnique({ where: { id: requestId } });
+  if (!request || request.status !== SchoolRequestStatus.PENDING) { res.status(404).json({ error: "Pending school request not found" }); return; }
+
+  if (input.data.decision === "reject") {
+    const rejected = await prisma.schoolAccessRequest.updateMany({
+      where: { id: requestId, status: SchoolRequestStatus.PENDING },
+      data: { status: SchoolRequestStatus.REJECTED, reviewerId: req.principal!.id, reviewNote: input.data.reviewNote, reviewedAt: new Date() },
+    });
+    if (rejected.count !== 1) { res.status(409).json({ error: "This request has already been reviewed" }); return; }
+    await prisma.auditLog.create({ data: { actorId: req.principal!.id, action: "school_request.reject", entityType: "school_access_request", entityId: requestId } });
+    let responseSent = false;
+    try {
+      const note = input.data.reviewNote?.trim();
+      await sendTransactionalEmail(
+        request.email,
+        `Update on ${request.schoolName}'s KidGuard request`,
+        `Thank you for your interest in KidGuard. We are unable to approve ${request.schoolName}'s request at this time.${note ? ` Review note: ${note}` : ""}`,
+        `<div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;padding:28px;color:#112442"><h2>Update on your KidGuard request</h2><p>Thank you for your interest. We are unable to approve ${escapeHtml(request.schoolName)}'s request at this time.</p>${note ? `<p>${escapeHtml(note)}</p>` : ""}</div>`,
+      );
+    } catch { console.error("School request decision email failed", requestId); }
+    res.json({ status: SchoolRequestStatus.REJECTED });
+    return;
+  }
+
+  const invitation = createInvitationToken();
+  const approved = await prisma.$transaction(async transaction => {
+    await transaction.$queryRaw`SELECT "id" FROM "SchoolAccessRequest" WHERE "id" = ${requestId} FOR UPDATE`;
+    const current = await transaction.schoolAccessRequest.findUniqueOrThrow({ where: { id: requestId } });
+    if (current.status !== SchoolRequestStatus.PENDING) return null;
+    const school = await transaction.school.create({ data: {
+      name: current.schoolName,
+      address: current.schoolAddress,
+      phone: current.phone,
+      email: current.email,
+      website: current.website ?? undefined,
+      principalName: current.contactName,
+    } });
+    const invite = await transaction.schoolInvitation.create({ data: {
+      tokenHash: invitation.tokenHash,
+      email: current.email,
+      fullName: current.contactName,
+      phone: current.phone,
+      role: Role.ADMIN,
+      schoolId: school.id,
+      creatorId: req.principal!.id,
+      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60_000),
+    } });
+    await transaction.schoolAccessRequest.update({ where: { id: requestId }, data: {
+      status: SchoolRequestStatus.APPROVED,
+      reviewerId: req.principal!.id,
+      reviewNote: input.data.reviewNote,
+      reviewedAt: new Date(),
+      schoolId: school.id,
+    } });
+    await transaction.auditLog.create({ data: { actorId: req.principal!.id, action: "school_request.approve", entityType: "school", entityId: school.id, details: { requestId } } });
+    return { school, invite };
+  });
+  if (!approved) { res.status(409).json({ error: "This request has already been reviewed" }); return; }
+
+  let invitationSent = false;
+  try { await emailSchoolInvitation(request.email, approved.school.name, Role.ADMIN, invitation.token); invitationSent = true; }
+  catch { console.error("School administrator invitation delivery failed", approved.invite.id); }
+  res.status(201).json({ status: SchoolRequestStatus.APPROVED, school: { id: approved.school.id, name: approved.school.name }, invitationId: approved.invite.id, invitationSent });
+}));
+
+app.get("/api/platform/invitations", authenticate, requirePlatformAdmin, asyncRoute(async (_req, res) => {
+  const invitations = await prisma.schoolInvitation.findMany({
+    orderBy: { createdAt: "desc" }, take: 250,
+    select: { id: true, email: true, fullName: true, phone: true, role: true, expiresAt: true, usedAt: true, createdAt: true, school: { select: { id: true, name: true, isActive: true } }, creator: { select: { fullName: true, email: true } } },
+  });
+  res.json({ invitations });
+}));
+app.post("/api/admin/school-invitations", authenticate, allow(Role.ADMIN), asyncRoute(async (req, res) => {
+  const input = z.object({ email: z.string().trim().email().max(254).transform(value => value.toLowerCase()), fullName: z.string().trim().min(2).max(160), phone: z.string().trim().max(40).optional(), schoolId: z.string().optional() }).safeParse(req.body);
+  if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
+  const schoolId = req.principal!.schoolId ?? input.data.schoolId;
+  if (!schoolId || (req.principal!.schoolId && schoolId !== req.principal!.schoolId)) { res.status(403).json({ error: "Choose a school within your authorized scope" }); return; }
+  const school = await prisma.school.findUnique({ where: { id: schoolId }, select: { id: true, name: true } });
+  if (!school) { res.status(404).json({ error: "School not found" }); return; }
+  const existingMember = await prisma.user.findUnique({ where: { email: input.data.email }, select: { role: true, schoolId: true } });
+  if (existingMember && existingMember.schoolId !== schoolId) { res.status(409).json({ error: "This email already belongs to another account or school" }); return; }
+  const invitation = createInvitationToken();
+  const invite = await prisma.schoolInvitation.create({ data: {
+    tokenHash: invitation.tokenHash,
+    email: input.data.email,
+    fullName: input.data.fullName,
+    phone: input.data.phone,
+    role: Role.TEACHER,
+    schoolId,
+    creatorId: req.principal!.id,
+    expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60_000),
+  } });
+  try {
+    await emailSchoolInvitation(input.data.email, school.name, Role.TEACHER, invitation.token);
+  } catch {
+    console.error("Teacher invitation delivery failed", invite.id);
+    res.status(503).json({ error: "Mwaliko umehifadhiwa lakini email haikutumwa. Kagua Resend kisha ujaribu tena.", invitationId: invite.id });
+    return;
+  }
+  await prisma.auditLog.create({ data: { actorId: req.principal!.id, action: "school_invitation.create", entityType: "school_invitation", entityId: invite.id, details: { role: Role.TEACHER, schoolId } } });
+  res.status(201).json({ sent: true });
+}));
+
+app.post("/api/admin/school-invitations/:invitationId/resend", authenticate, allow(Role.ADMIN), asyncRoute(async (req, res) => {
+  const invitationId = req.params.invitationId.toString();
+  const invitation = await prisma.schoolInvitation.findUnique({ where: { id: invitationId }, include: { school: { select: { id: true, name: true } } } });
+  if (!invitation || (req.principal!.schoolId && req.principal!.schoolId !== invitation.schoolId)) { res.status(404).json({ error: "Invitation not found" }); return; }
+  if (invitation.usedAt) { res.status(409).json({ error: "Invitation has already been used" }); return; }
+  const newToken = createInvitationToken();
+  const updated = await prisma.schoolInvitation.updateMany({ where: { id: invitationId, usedAt: null }, data: { tokenHash: newToken.tokenHash, expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60_000) } });
+  if (updated.count !== 1) { res.status(409).json({ error: "Invitation has already been used" }); return; }
+  try {
+    await emailSchoolInvitation(invitation.email, invitation.school.name, invitation.role, newToken.token);
+  } catch {
+    console.error("School invitation resend failed", invitation.id);
+    res.status(503).json({ error: "Email haikutumwa. Hakikisha Resend imewekwa kisha ujaribu tena." });
+    return;
+  }
+  res.json({ sent: true });
+}));
+
+app.post("/api/school-invitations/claim", asyncRoute(async (req, res) => {
+  const input = z.object({ invitationToken: z.string().min(32).max(128), email: z.string().email().max(254), password: z.string().min(10).max(128), fullName: z.string().trim().min(2).max(160).optional() }).safeParse(req.body);
+  if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
+  const email = input.data.email.trim().toLowerCase();
+  const tokenHash = createHash("sha256").update(input.data.invitationToken).digest("hex");
+  const result = await prisma.$transaction(async transaction => {
+    await transaction.$queryRaw`SELECT "id" FROM "SchoolInvitation" WHERE "tokenHash" = ${tokenHash} FOR UPDATE`;
+    const invitation = await transaction.schoolInvitation.findUnique({ where: { tokenHash }, include: { school: { select: { id: true, isActive: true } } } });
+    if (!invitation || invitation.usedAt || invitation.expiresAt <= new Date() || invitation.school.isActive !== true || invitation.email.toLowerCase() !== email) return null;
+    const existingByEmail = await transaction.user.findUnique({ where: { email } });
+    if (existingByEmail && existingByEmail.schoolId && existingByEmail.schoolId !== invitation.schoolId) return null;
+    if (existingByEmail?.role === Role.ADMIN && existingByEmail.schoolId === null) return null;
+    if (existingByEmail?.passwordHash) return null;
+    const user = existingByEmail
+      ? await transaction.user.update({ where: { id: existingByEmail.id }, data: { passwordHash: hashPassword(input.data.password), fullName: input.data.fullName || invitation.fullName, phone: invitation.phone ?? existingByEmail.phone, emailVerified: true, role: invitation.role, schoolId: invitation.schoolId, isActive: true } })
+      : await transaction.user.create({ data: { firebaseUid: `pg_${randomBytes(20).toString("hex")}`, email, passwordHash: hashPassword(input.data.password), fullName: input.data.fullName || invitation.fullName, phone: invitation.phone, emailVerified: true, role: invitation.role, schoolId: invitation.schoolId } });
+    await transaction.schoolInvitation.update({ where: { id: invitation.id }, data: { usedAt: new Date() } });
+    await transaction.auditLog.create({ data: { actorId: user.id, action: "school_invitation.claim", entityType: "school", entityId: invitation.schoolId, details: { role: invitation.role } } });
+    return { user, role: invitation.role };
+  });
+  if (!result) { res.status(400).json({ error: "Mwaliko si sahihi, umetumika, au email/akaunti haiendani" }); return; }
+  res.json({ joined: true, role: result.role, schoolId: result.user.schoolId, token: signAccessToken(result.user.id), user: publicUser(result.user) });
+}));
+
+app.post("/api/auth/email-otp/request", asyncRoute(async (req, res) => {
+  const input = z.object({ email: z.string().email().max(254).transform(value => value.trim().toLowerCase()), fullName: z.string().trim().min(1).max(160), phone: z.string().trim().max(40).optional(), purpose: z.enum(["registration", "password_reset"]).default("registration") }).safeParse(req.body);
+  if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
+  if (!resendApiKey || !resendFromEmail || !otpHashSecret || Buffer.byteLength(otpHashSecret) < 32) { res.status(503).json({ error: "Email verification is not configured" }); return; }
+  const { email, fullName, phone } = input.data;
+  const existingUser = await prisma.user.findUnique({ where: { email }, select: { emailVerified: true, passwordHash: true } });
+  if (input.data.purpose === "registration" && existingUser?.emailVerified && existingUser.passwordHash) { res.status(409).json({ error: "Email is already registered" }); return; }
+  if (input.data.purpose === "password_reset" && !existingUser?.passwordHash) { res.status(202).json({ sent: true, expiresInSeconds: 600, resendAfterSeconds: 60 }); return; }
+  const code = randomInt(0, 1_000_000).toString().padStart(6, "0");
+  const otpHash = hashEmailOtp(email, code);
+  const now = new Date();
+  const hourAgo = new Date(now.getTime() - 60 * 60 * 1000);
+  const result = await prisma.$transaction(async transaction => {
+    await transaction.emailOtpVerification.upsert({
+      where: { email },
+      create: { email, otpHash, fullName, phone, attempts: 0, sendsInWindow: 0, sendWindowStartedAt: new Date(0), sentAt: new Date(0), expiresAt: new Date(0) },
+      update: {},
+    });
+    await transaction.$queryRaw`SELECT "email" FROM "EmailOtpVerification" WHERE "email" = ${email} FOR UPDATE`;
+    const current = await transaction.emailOtpVerification.findUniqueOrThrow({ where: { email } });
+    const cooldownEnds = current.sentAt.getTime() + 60_000;
+    if (current.sentAt.getTime() > now.getTime() - 60_000) return { error: "Please wait before requesting another code", retryAfterSeconds: Math.ceil((cooldownEnds - now.getTime()) / 1000) };
+    const resetWindow = current.sendWindowStartedAt < hourAgo;
+    if (!resetWindow && current.sendsInWindow >= 5) return { error: "Too many codes requested. Try again in an hour", retryAfterSeconds: Math.ceil((current.sendWindowStartedAt.getTime() + 60 * 60 * 1000 - now.getTime()) / 1000) };
+    await transaction.emailOtpVerification.update({ where: { email }, data: {
+      otpHash, fullName, phone, attempts: 0, sentAt: now,
+      expiresAt: new Date(now.getTime() + 10 * 60_000), verifiedAt: null, registrationExpiresAt: null, consumedAt: null,
+      sendsInWindow: resetWindow ? 1 : { increment: 1 }, sendWindowStartedAt: resetWindow ? now : current.sendWindowStartedAt,
+    } });
+    return { sent: true };
+  });
+  if ("error" in result) { res.status(429).json(result); return; }
+  try { await sendEmailOtp(email, code); }
+  catch {
+    await prisma.emailOtpVerification.updateMany({ where: { email, otpHash }, data: { expiresAt: new Date(0), sentAt: new Date(0), otpHash: randomBytes(32).toString("hex") } });
+    res.status(503).json({ error: "Could not send the verification email. Try again shortly" }); return;
+  }
+  res.status(202).json({ sent: true, expiresInSeconds: 600, resendAfterSeconds: 60 });
+}));
+
+app.post("/api/auth/email-otp/verify", asyncRoute(async (req, res) => {
+  const input = z.object({ email: z.string().email().max(254).transform(value => value.trim().toLowerCase()), code: z.string().regex(/^\d{6}$/) }).safeParse(req.body);
+  if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
+  const { email, code } = input.data;
+  const now = new Date();
+  const result = await prisma.$transaction(async transaction => {
+    const row = await transaction.emailOtpVerification.findUnique({ where: { email } });
+    if (!row) return { error: "Verification code is invalid or expired", status: 400 };
+    await transaction.$queryRaw`SELECT "email" FROM "EmailOtpVerification" WHERE "email" = ${email} FOR UPDATE`;
+    const current = await transaction.emailOtpVerification.findUniqueOrThrow({ where: { email } });
+    if (current.verifiedAt && current.registrationExpiresAt && current.registrationExpiresAt > now && !current.consumedAt) return { verified: true };
+    if (current.expiresAt <= now || current.consumedAt) return { error: "Verification code is invalid or expired", status: 410 };
+    if (current.attempts >= 5) return { error: "Too many incorrect codes. Request a new one", status: 429 };
+    const suppliedHash = Buffer.from(hashEmailOtp(email, code), "hex");
+    const storedHash = Buffer.from(current.otpHash, "hex");
+    if (suppliedHash.length !== storedHash.length || !timingSafeEqual(suppliedHash, storedHash)) {
+      const attempts = current.attempts + 1;
+      await transaction.emailOtpVerification.update({ where: { email }, data: { attempts } });
+      return { error: attempts >= 5 ? "Too many incorrect codes. Request a new one" : "Incorrect verification code", status: attempts >= 5 ? 429 : 400 };
+    }
+    await transaction.emailOtpVerification.update({ where: { email }, data: { verifiedAt: now, registrationExpiresAt: new Date(now.getTime() + 30 * 60_000), otpHash: randomBytes(32).toString("hex") } });
+    return { verified: true };
+  });
+  if ("error" in result) { res.status(result.status ?? 400).json({ error: result.error }); return; }
+  res.json({ verified: true });
+}));
+
+app.post("/api/auth/password-reset/confirm", asyncRoute(async (req, res) => {
+  const input = z.object({ email: z.string().email().max(254).transform(value => value.trim().toLowerCase()), password: z.string().min(10).max(128) }).safeParse(req.body);
+  if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
+  const now = new Date();
+  const user = await prisma.$transaction(async transaction => {
+    await transaction.$queryRaw`SELECT "email" FROM "EmailOtpVerification" WHERE "email" = ${input.data.email} FOR UPDATE`;
+    const verification = await transaction.emailOtpVerification.findUnique({ where: { email: input.data.email } });
+    if (!verification?.verifiedAt || !verification.registrationExpiresAt || verification.registrationExpiresAt <= now || verification.consumedAt) return null;
+    const existing = await transaction.user.findUnique({ where: { email: input.data.email } });
+    if (!existing?.passwordHash) return null;
+    const updated = await transaction.user.update({ where: { id: existing.id }, data: { passwordHash: hashPassword(input.data.password) } });
+    await transaction.emailOtpVerification.update({ where: { email: input.data.email }, data: { consumedAt: now } });
+    await transaction.auditLog.create({ data: { actorId: updated.id, action: "auth.password_reset", entityType: "user", entityId: updated.id } });
+    return updated;
+  });
+  if (!user) { res.status(400).json({ error: "Verified reset code is missing or expired" }); return; }
+  res.json({ reset: true });
+}));
+
+app.post("/api/auth/register", asyncRoute(async (req, res) => {
+  const input = z.object({ email: z.string().email().max(254).transform(value => value.trim().toLowerCase()), password: z.string().min(10).max(128) }).safeParse(req.body);
+  if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
+  const now = new Date();
+  const result = await prisma.$transaction(async transaction => {
+    await transaction.$queryRaw`SELECT "email" FROM "EmailOtpVerification" WHERE "email" = ${input.data.email} FOR UPDATE`;
+    const verification = await transaction.emailOtpVerification.findUnique({ where: { email: input.data.email } });
+    if (!verification?.verifiedAt || !verification.registrationExpiresAt || verification.registrationExpiresAt <= now || verification.consumedAt) return null;
+    const duplicate = await transaction.user.findUnique({ where: { email: input.data.email } });
+    if (duplicate) return null;
+    const user = await transaction.user.create({ data: {
+      firebaseUid: `pg_${randomBytes(20).toString("hex")}`,
+      email: input.data.email, passwordHash: hashPassword(input.data.password),
+      fullName: verification.fullName, phone: verification.phone, emailVerified: true, role: Role.PARENT,
+    } });
+    await transaction.emailOtpVerification.update({ where: { email: input.data.email }, data: { consumedAt: now } });
+    await transaction.auditLog.create({ data: { actorId: user.id, action: "auth.self_register", entityType: "user", entityId: user.id } });
+    return user;
+  });
+  if (!result) { res.status(409).json({ error: "Email verification is missing or expired, or this email already has an account" }); return; }
+  res.status(201).json({ token: signAccessToken(result.id), user: publicUser(result) });
+}));
+
+app.post("/api/auth/login", asyncRoute(async (req, res) => {
+  const input = z.object({ email: z.string().email().max(254).transform(value => value.trim().toLowerCase()), password: z.string().min(1).max(128) }).safeParse(req.body);
+  if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
+  const user = await prisma.user.findUnique({ where: { email: input.data.email } });
+  if (!user?.passwordHash) { res.status(401).json({ error: "Account password is not set. Use email verification to migrate this account first." }); return; }
+  if (!verifyPassword(input.data.password, user.passwordHash)) { res.status(401).json({ error: "Email or password is incorrect" }); return; }
+  if (!user.emailVerified) { res.status(403).json({ error: "Verify your email before signing in" }); return; }
+  if (!user.isActive) { res.status(403).json({ error: "This account is disabled" }); return; }
+  if (user.schoolId) {
+    const school = await prisma.school.findUnique({ where: { id: user.schoolId }, select: { isActive: true } });
+    if (!school?.isActive) { res.status(403).json({ error: "School access is suspended" }); return; }
+  }
+  await prisma.auditLog.create({ data: { actorId: user.id, action: "auth.login", entityType: "user", entityId: user.id } });
+  res.json({ token: signAccessToken(user.id), user: publicUser(user) });
+}));
+
+app.post("/api/auth/google", asyncRoute(async (req, res) => {
+  const input = z.object({ idToken: z.string().min(100).max(8192) }).safeParse(req.body);
+  if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
+  if (!googleClientIds.length) { res.status(503).json({ error: "Google sign-in is not configured" }); return; }
+  let payload;
+  try {
+    payload = (await new OAuth2Client().verifyIdToken({ idToken: input.data.idToken, audience: googleClientIds })).getPayload();
+  } catch { res.status(401).json({ error: "Google credential is invalid or expired" }); return; }
+  if (!payload?.sub || !payload.email || payload.email_verified !== true) { res.status(401).json({ error: "A verified Google email is required" }); return; }
+  const email = payload.email.trim().toLowerCase();
+  let user = await prisma.user.findUnique({ where: { email } });
+  if (!user) {
+    user = await prisma.user.create({ data: { firebaseUid: `pg_${randomBytes(20).toString("hex")}`, email, fullName: payload.name || email, profileImageUrl: payload.picture, emailVerified: true, role: Role.PARENT } });
+    await prisma.auditLog.create({ data: { actorId: user.id, action: "auth.google_register", entityType: "user", entityId: user.id } });
+  } else if (!user.isActive) { res.status(403).json({ error: "This account is disabled" }); return; }
+  if (user.schoolId) {
+    const school = await prisma.school.findUnique({ where: { id: user.schoolId }, select: { isActive: true } });
+    if (!school?.isActive) { res.status(403).json({ error: "School access is suspended" }); return; }
+  }
+  await prisma.user.update({ where: { id: user.id }, data: { emailVerified: true, profileImageUrl: user.profileImageUrl ?? payload.picture } });
+  res.json({ token: signAccessToken(user.id), user: publicUser(user) });
+}));
+
+app.post("/api/auth/migrate-password", asyncRoute(async (req, res) => {
+  const input = z.object({ email: z.string().email().max(254).transform(value => value.trim().toLowerCase()), password: z.string().min(10).max(128) }).safeParse(req.body);
+  if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
+  const now = new Date();
+  const user = await prisma.$transaction(async transaction => {
+    await transaction.$queryRaw`SELECT "email" FROM "EmailOtpVerification" WHERE "email" = ${input.data.email} FOR UPDATE`;
+    const verification = await transaction.emailOtpVerification.findUnique({ where: { email: input.data.email } });
+    if (!verification?.verifiedAt || !verification.registrationExpiresAt || verification.registrationExpiresAt <= now || verification.consumedAt) return null;
+    const existing = await transaction.user.findUnique({ where: { email: input.data.email } });
+    if (!existing || existing.passwordHash) return null;
+    const updated = await transaction.user.update({ where: { id: existing.id }, data: { passwordHash: hashPassword(input.data.password), emailVerified: true } });
+    await transaction.emailOtpVerification.update({ where: { email: input.data.email }, data: { consumedAt: now } });
+    await transaction.auditLog.create({ data: { actorId: updated.id, action: "auth.password_migrated", entityType: "user", entityId: updated.id } });
+    return updated;
+  });
+  if (!user) { res.status(409).json({ error: "No eligible legacy account or verified email code was found" }); return; }
+  res.json({ token: signAccessToken(user.id), user: publicUser(user) });
+}));
+
 app.get("/", (_req, res) => res.json({
   name: "KidGuard API",
   status: "ok",
@@ -80,6 +604,80 @@ app.get("/", (_req, res) => res.json({
 }));
 
 app.get("/health", (_req, res) => res.json({ status: "ok", service: "kidguard-api" }));
+
+app.get("/api/records/:collection", authenticate, asyncRoute(async (req, res) => {
+  const collection = req.params.collection.toString();
+  if (!legacyCollections.has(collection)) { res.status(404).json({ error: "Record collection not found" }); return; }
+  const scope = await legacyScope(req.principal!);
+  const requestedStudent = typeof req.query.studentId === "string" ? req.query.studentId : undefined;
+  if (requestedStudent && !scope.childIds.has(requestedStudent) && req.principal!.role !== Role.ADMIN) { res.status(403).json({ error: "Student is outside your authorized scope" }); return; }
+  const limit = Math.min(500, Math.max(1, Number.parseInt(String(req.query.limit ?? "200"), 10) || 200));
+  const records = await prisma.legacyRecord.findMany({ where: { collection }, orderBy: { updatedAt: "desc" }, take: 2000 });
+  const rows = [];
+  for (const record of records) {
+    const data = objectData(record.data);
+    if (requestedStudent && (data.studentId ?? data.childId) !== requestedStudent) continue;
+    if (typeof req.query.classId === "string" && data.classId !== req.query.classId) continue;
+    if (!await canReadLegacy(req.principal!, collection, data, scope)) continue;
+    rows.push({ id: record.sourceId, ...data });
+    if (rows.length >= limit) break;
+  }
+  res.json({ records: rows });
+}));
+
+app.post("/api/records/:collection", authenticate, asyncRoute(async (req, res) => {
+  const collection = req.params.collection.toString();
+  if (!legacyCollections.has(collection)) { res.status(404).json({ error: "Record collection not found" }); return; }
+  const input = z.record(z.unknown()).safeParse(req.body);
+  if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
+  const user = req.principal!;
+  const scope = await legacyScope(user);
+  const data: Record<string, unknown> = { ...input.data };
+  delete data.id;
+  if (user.role === Role.TEACHER) { data.teacherId = user.firebaseUid; data.authorId ??= user.firebaseUid; data.schoolId = user.schoolId; }
+  if (user.role === Role.PARENT) {
+    if (collection === "homework_submissions") data.studentId = typeof input.data.studentId === "string" ? input.data.studentId : undefined;
+    else data.parentId = user.firebaseUid;
+    if (collection === "feedback") data.userId = user.firebaseUid;
+  }
+  if (!await canWriteLegacy(user, collection, data, scope)) { res.status(403).json({ error: "You cannot create this record" }); return; }
+  const id = `legacy_${randomBytes(18).toString("hex")}`;
+  const record = await prisma.legacyRecord.create({ data: { collection, sourceId: id, data: data as Prisma.InputJsonValue } });
+  res.status(201).json({ record: { id: record.sourceId, ...data } });
+}));
+
+app.patch("/api/records/:collection/:recordId", authenticate, asyncRoute(async (req, res) => {
+  const collection = req.params.collection.toString();
+  if (!legacyCollections.has(collection)) { res.status(404).json({ error: "Record collection not found" }); return; }
+  const input = z.record(z.unknown()).safeParse(req.body);
+  if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
+  const record = await prisma.legacyRecord.findUnique({ where: { collection_sourceId: { collection, sourceId: req.params.recordId.toString() } } });
+  if (!record) { res.status(404).json({ error: "Record not found" }); return; }
+  const user = req.principal!;
+  const scope = await legacyScope(user);
+  const oldData = objectData(record.data);
+  const readOnlyMark = collection === "announcements" && Object.keys(input.data).every(key => key === "readBy") && await canReadLegacy(user, collection, oldData, scope);
+  if (!readOnlyMark && !await canWriteLegacy(user, collection, oldData, scope)) { res.status(403).json({ error: "You cannot update this record" }); return; }
+  const merged = { ...oldData, ...input.data };
+  if (readOnlyMark) {
+    const readBy = Array.isArray(oldData.readBy) ? oldData.readBy.map(String) : [];
+    merged.readBy = [...new Set([...readBy, user.firebaseUid])];
+  }
+  const updated = await prisma.legacyRecord.update({ where: { collection_sourceId: { collection, sourceId: record.sourceId } }, data: { data: merged as Prisma.InputJsonValue } });
+  res.json({ record: { id: updated.sourceId, ...merged } });
+}));
+
+app.delete("/api/records/:collection/:recordId", authenticate, asyncRoute(async (req, res) => {
+  const collection = req.params.collection.toString();
+  if (!legacyCollections.has(collection)) { res.status(404).json({ error: "Record collection not found" }); return; }
+  const record = await prisma.legacyRecord.findUnique({ where: { collection_sourceId: { collection, sourceId: req.params.recordId.toString() } } });
+  if (!record) { res.status(204).end(); return; }
+  const scope = await legacyScope(req.principal!);
+  if (req.principal!.role !== Role.ADMIN || (req.principal!.schoolId && objectData(record.data).schoolId !== req.principal!.schoolId)) { res.status(403).json({ error: "Only an authorized administrator can delete this record" }); return; }
+  await prisma.legacyRecord.delete({ where: { collection_sourceId: { collection, sourceId: record.sourceId } } });
+  void scope;
+  res.status(204).end();
+}));
 
 app.get("/api/schools", authenticate, asyncRoute(async (req, res) => {
   const user = req.principal!;
@@ -146,36 +744,225 @@ app.post("/api/admin/schools/:schoolId/classes", authenticate, allow(Role.ADMIN)
   res.status(201).json({ class: schoolClass });
 }));
 
-// Firebase Auth remains the identity provider. Self-service sync can only create a PARENT;
-// ADMIN and TEACHER accounts must be provisioned by an authorized operator.
-app.post("/api/auth/sync", asyncRoute(async (req, res) => {
-  if (!getApps().length) { res.status(503).json({ error: "Authentication service is not configured" }); return; }
-  const token = req.header("authorization")?.match(/^Bearer (.+)$/i)?.[1];
-  if (!token) { res.status(401).json({ error: "Bearer token required" }); return; }
-  let decoded;
-  try { decoded = await getAuth().verifyIdToken(token); }
-  catch { res.status(401).json({ error: "Invalid or expired token" }); return; }
-  const firebaseUser = await getAuth().getUser(decoded.uid);
-  if (!firebaseUser.email) { res.status(400).json({ error: "Verified email is required" }); return; }
-  const legacyAccount = await prisma.legacyRecord.findUnique({ where: { collection_sourceId: { collection: "users_unmapped", sourceId: decoded.uid } }, select: { data: true } });
-  const legacyRole = legacyAccount?.data && typeof legacyAccount.data === "object" && !Array.isArray(legacyAccount.data) ? (legacyAccount.data as Record<string, unknown>).role : undefined;
-  if (typeof legacyRole === "string" && ["child", "student"].includes(legacyRole.toLowerCase())) { res.status(403).json({ error: "Child profiles do not have login accounts" }); return; }
-  if (await prisma.child.findUnique({ where: { id: decoded.uid }, select: { id: true } })) { res.status(403).json({ error: "Child profiles do not have login accounts" }); return; }
-  const existing = await prisma.user.findUnique({ where: { firebaseUid: decoded.uid } });
-  const claimedRole = decoded.role === "ADMIN" ? Role.ADMIN : decoded.role === "TEACHER" ? Role.TEACHER : Role.PARENT;
-  const claimedSchoolId = typeof decoded.schoolId === "string" ? decoded.schoolId : undefined;
-  const user = await prisma.user.upsert({ where: { firebaseUid: decoded.uid }, create: { firebaseUid: decoded.uid, email: firebaseUser.email, fullName: firebaseUser.displayName || firebaseUser.email, phone: firebaseUser.phoneNumber, role: claimedRole, schoolId: claimedSchoolId }, update: { email: firebaseUser.email, fullName: firebaseUser.displayName || existing?.fullName || firebaseUser.email, phone: firebaseUser.phoneNumber ?? existing?.phone } });
-  if (!existing) await prisma.auditLog.create({ data: { actorId: user.id, action: "auth.self_register", entityType: "user", entityId: user.id } });
-  res.status(existing ? 200 : 201).json({ id: user.firebaseUid, databaseId: user.id, role: user.role, fullName: user.fullName, email: user.email });
+app.get("/api/platform/overview", authenticate, requirePlatformAdmin, asyncRoute(async (_req, res) => {
+  const now = new Date();
+  const currentHour = new Date(now);
+  currentHour.setUTCHours(currentHour.getUTCHours(), 0, 0, 0);
+  const since = new Date(currentHour.getTime() - 23 * 60 * 60_000);
+  const [users, parents, teachers, admins, schools, activeSchools, students, devices, activeDevices, events24h, audit24h, unreadNotifications, pendingSchoolRequests] = await Promise.all([
+    prisma.user.count(),
+    prisma.user.count({ where: { role: Role.PARENT, isActive: true } }),
+    prisma.user.count({ where: { role: Role.TEACHER, isActive: true } }),
+    prisma.user.count({ where: { role: Role.ADMIN, schoolId: null, isActive: true } }),
+    prisma.school.count(),
+    prisma.school.count({ where: { isActive: true } }),
+    prisma.child.count(),
+    prisma.device.count(),
+    prisma.device.count({ where: { isAuthorized: true } }),
+    prisma.deviceActivityEvent.count({ where: { createdAt: { gte: since } } }),
+    prisma.auditLog.count({ where: { createdAt: { gte: since } } }),
+    prisma.notification.count({ where: { isRead: false } }),
+    prisma.schoolAccessRequest.count({ where: { status: SchoolRequestStatus.PENDING } }),
+  ]);
+  const [eventHours, auditHours] = await Promise.all([
+    prisma.$queryRaw<{ bucket: Date; total: bigint }[]>`SELECT date_trunc('hour', "createdAt") AS bucket, COUNT(*) AS total FROM "DeviceActivityEvent" WHERE "createdAt" >= ${since} GROUP BY bucket ORDER BY bucket`,
+    prisma.$queryRaw<{ bucket: Date; total: bigint }[]>`SELECT date_trunc('hour', "createdAt") AS bucket, COUNT(*) AS total FROM "AuditLog" WHERE "createdAt" >= ${since} GROUP BY bucket ORDER BY bucket`,
+  ]);
+  const hourMap = new Map<string, { events: number; audits: number }>();
+  for (let offset = 0; offset < 24; offset++) {
+    const bucket = new Date(since.getTime() + offset * 60 * 60_000).toISOString();
+    hourMap.set(bucket, { events: 0, audits: 0 });
+  }
+  for (const row of eventHours) {
+    const bucket = new Date(row.bucket).toISOString();
+    const current = hourMap.get(bucket);
+    if (current) current.events = Number(row.total);
+  }
+  for (const row of auditHours) {
+    const bucket = new Date(row.bucket).toISOString();
+    const current = hourMap.get(bucket);
+    if (current) current.audits = Number(row.total);
+  }
+  res.json({ generatedAt: now.toISOString(), activityByHour: [...hourMap.entries()].map(([hour, totals]) => ({ hour, ...totals })), counts: { users, parents, teachers, platformAdmins: admins, schools, activeSchools, students, devices, activeDevices, events24h, audit24h, unreadNotifications, pendingSchoolRequests } });
 }));
 
+app.get("/api/platform/users/:firebaseUid", authenticate, requirePlatformAdmin, asyncRoute(async (req, res) => {
+  const firebaseUid = req.params.firebaseUid.toString();
+  const user = await prisma.user.findUnique({
+    where: { firebaseUid },
+    include: {
+      school: { select: { id: true, name: true, isActive: true } },
+      children: { include: { child: { include: { school: { select: { id: true, name: true } }, classroom: { select: { id: true, name: true } }, _count: { select: { devices: true, activityEvents: true } } } } } },
+      taught: { include: { student: { include: { school: { select: { id: true, name: true } }, classroom: { select: { id: true, name: true } }, _count: { select: { devices: true, activityEvents: true } } } } } },
+      devices: { select: { id: true, name: true, model: true, platform: true, appVersion: true, status: true, isAuthorized: true, lastSeen: true, createdAt: true } },
+      _count: { select: { children: true, taught: true, devices: true, notifications: true } },
+    },
+  });
+  if (!user) { res.status(404).json({ error: "User not found" }); return; }
+  const [notifications, auditLogs] = await Promise.all([
+    prisma.notification.findMany({ where: { recipientId: user.id }, orderBy: { createdAt: "desc" }, take: 20, select: { id: true, title: true, body: true, type: true, isRead: true, createdAt: true } }),
+    prisma.auditLog.findMany({ where: { entityId: user.id }, orderBy: { createdAt: "desc" }, take: 20, include: { actor: { select: { fullName: true, email: true } } } }),
+  ]);
+  const { children, taught, devices, _count, ...profile } = user;
+  res.json({
+    user: { ...publicUser(profile), linkedChildrenCount: _count.children, taughtStudentsCount: _count.taught, devicesCount: _count.devices, notificationsCount: _count.notifications },
+    children: children.map(link => ({ ...link.child, devicesCount: link.child._count.devices, activityCount: link.child._count.activityEvents })),
+    taughtStudents: taught.map(link => ({ ...link.student, devicesCount: link.student._count.devices, activityCount: link.student._count.activityEvents })),
+    devices, notifications, auditLogs,
+  });
+}));
+
+app.get("/api/platform/users", authenticate, requirePlatformAdmin, asyncRoute(async (req, res) => {
+  const search = typeof req.query.search === "string" ? req.query.search.trim().slice(0, 100) : "";
+  const role = typeof req.query.role === "string" && Object.values(Role).includes(req.query.role as Role) ? req.query.role as Role : undefined;
+  const schoolId = typeof req.query.schoolId === "string" ? req.query.schoolId : undefined;
+  const page = Math.max(1, Number.parseInt(String(req.query.page ?? "1"), 10) || 1);
+  const pageSize = Math.min(100, Math.max(1, Number.parseInt(String(req.query.pageSize ?? "50"), 10) || 50));
+  const where: Prisma.UserWhereInput = {
+    ...(role ? { role } : {}), ...(schoolId ? { schoolId } : {}),
+    ...(search ? { OR: [{ email: { contains: search, mode: "insensitive" } }, { fullName: { contains: search, mode: "insensitive" } }, { phone: { contains: search, mode: "insensitive" } }] } : {}),
+  };
+  const [total, rows] = await Promise.all([
+    prisma.user.count({ where }),
+    prisma.user.findMany({ where, orderBy: { createdAt: "desc" }, skip: (page - 1) * pageSize, take: pageSize, include: { school: { select: { id: true, name: true, isActive: true } }, _count: { select: { children: true, taught: true, devices: true } } } }),
+  ]);
+  res.json({ page, pageSize, total, users: rows.map(row => ({ ...publicUser(row), linkedChildrenCount: row._count.children, taughtStudentsCount: row._count.taught, devicesCount: row._count.devices })) });
+}));
+
+app.patch("/api/platform/users/:firebaseUid", authenticate, requirePlatformAdmin, asyncRoute(async (req, res) => {
+  const firebaseUid = req.params.firebaseUid.toString();
+  const input = z.object({
+    role: z.nativeEnum(Role).optional(),
+    schoolId: z.string().nullable().optional(),
+    isActive: z.boolean().optional(),
+    fullName: z.string().trim().min(2).max(160).optional(),
+    phone: z.string().trim().max(40).nullable().optional(),
+  }).refine(value => Object.keys(value).length > 0).safeParse(req.body);
+  if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
+  const target = await prisma.user.findUnique({ where: { firebaseUid } });
+  if (!target) { res.status(404).json({ error: "User not found" }); return; }
+  const newRole = input.data.role ?? target.role;
+  const newSchoolId = input.data.schoolId === undefined ? target.schoolId : input.data.schoolId;
+  const newIsActive = input.data.isActive ?? target.isActive;
+  if (newSchoolId && !await prisma.school.findUnique({ where: { id: newSchoolId }, select: { id: true } })) { res.status(400).json({ error: "School not found" }); return; }
+  const targetIsGlobalAdmin = target.role === Role.ADMIN && target.schoolId === null && target.isActive;
+  const remainsGlobalAdmin = newRole === Role.ADMIN && newSchoolId === null && newIsActive;
+  if (targetIsGlobalAdmin && !remainsGlobalAdmin) {
+    const activeGlobalAdmins = await prisma.user.count({ where: { role: Role.ADMIN, schoolId: null, isActive: true } });
+    if (activeGlobalAdmins <= 1) { res.status(409).json({ error: "Cannot remove the last active platform administrator" }); return; }
+  }
+  const updated = await prisma.user.update({ where: { firebaseUid }, data: { ...input.data } });
+  await prisma.auditLog.create({ data: { actorId: req.principal!.id, action: "platform.user.update", entityType: "user", entityId: updated.id, details: { changedFields: Object.keys(input.data), role: updated.role, schoolId: updated.schoolId, isActive: updated.isActive } } });
+  res.json({ user: publicUser(updated) });
+}));
+
+app.get("/api/platform/schools", authenticate, requirePlatformAdmin, asyncRoute(async (_req, res) => {
+  const schools = await prisma.school.findMany({ orderBy: { createdAt: "desc" }, include: { _count: { select: { users: true, children: true, devices: true, classes: true } } } });
+  res.json({ schools: schools.map(({ _count, settings: _settings, ...school }) => ({ ...school, usersCount: _count.users, studentsCount: _count.children, devicesCount: _count.devices, classesCount: _count.classes })) });
+}));
+
+app.patch("/api/platform/schools/:schoolId", authenticate, requirePlatformAdmin, asyncRoute(async (req, res) => {
+  const schoolId = req.params.schoolId.toString();
+  const input = z.object({ isActive: z.boolean().optional(), name: z.string().trim().min(2).max(160).optional() }).refine(value => Object.keys(value).length > 0).safeParse(req.body);
+  if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
+  const school = await prisma.school.update({ where: { id: schoolId }, data: input.data });
+  await prisma.auditLog.create({ data: { actorId: req.principal!.id, action: "platform.school.update", entityType: "school", entityId: school.id, details: input.data } });
+  res.json({ school });
+}));
+
+app.get("/api/platform/students", authenticate, requirePlatformAdmin, asyncRoute(async (req, res) => {
+  const search = typeof req.query.search === "string" ? req.query.search.trim().slice(0, 100) : "";
+  const page = Math.max(1, Number.parseInt(String(req.query.page ?? "1"), 10) || 1);
+  const pageSize = Math.min(100, Math.max(1, Number.parseInt(String(req.query.pageSize ?? "50"), 10) || 50));
+  const where: Prisma.ChildWhereInput = search ? { OR: [{ fullName: { contains: search, mode: "insensitive" } }, { className: { contains: search, mode: "insensitive" } }] } : {};
+  const [total, students] = await Promise.all([
+    prisma.child.count({ where }),
+    prisma.child.findMany({ where, orderBy: { createdAt: "desc" }, skip: (page - 1) * pageSize, take: pageSize, include: { school: { select: { id: true, name: true } }, classroom: { select: { id: true, name: true } }, parents: { include: { parent: { select: { fullName: true, email: true } } } }, teachers: { include: { teacher: { select: { fullName: true, email: true } } } }, _count: { select: { devices: true, activityEvents: true } } } }),
+  ]);
+  res.json({ page, pageSize, total, students: students.map(student => ({ id: student.id, fullName: student.fullName, className: student.className, isActive: student.isActive, createdAt: student.createdAt, school: student.school, classroom: student.classroom, parents: student.parents.map(link => link.parent), teachers: student.teachers.map(link => link.teacher), devicesCount: student._count.devices, activityCount: student._count.activityEvents })) });
+}));
+
+app.get("/api/platform/students/:studentId", authenticate, requirePlatformAdmin, asyncRoute(async (req, res) => {
+  const studentId = req.params.studentId.toString();
+  const [student, activity, locations, screenTime] = await Promise.all([
+    prisma.child.findUnique({ where: { id: studentId }, include: { school: { select: { id: true, name: true } }, classroom: { select: { id: true, name: true } }, parents: { include: { parent: { select: { fullName: true, email: true, phone: true } } } }, teachers: { include: { teacher: { select: { fullName: true, email: true, phone: true } } } }, devices: { select: { id: true, name: true, platform: true, status: true, isAuthorized: true, lastSeen: true } } } }),
+    prisma.deviceActivityEvent.findMany({ where: { childId: studentId }, orderBy: { createdAt: "desc" }, take: 50, include: { device: { select: { name: true, platform: true } } } }),
+    prisma.deviceLocation.findMany({ where: { childId: studentId }, orderBy: { timestamp: "desc" }, take: 50, select: { latitude: true, longitude: true, accuracy: true, address: true, placeName: true, timestamp: true } }),
+    prisma.screenTimeRecord.findMany({ where: { childId: studentId }, orderBy: { date: "desc" }, take: 30, select: { date: true, totalMinutes: true, unlockedCount: true, appUsage: true } }),
+  ]);
+  if (!student) { res.status(404).json({ error: "Student not found" }); return; }
+  res.json({ student, activity, locations, screenTime });
+}));
+
+app.get("/api/platform/devices", authenticate, requirePlatformAdmin, asyncRoute(async (req, res) => {
+  const search = typeof req.query.search === "string" ? req.query.search.trim().slice(0, 100) : "";
+  const page = Math.max(1, Number.parseInt(String(req.query.page ?? "1"), 10) || 1);
+  const pageSize = Math.min(100, Math.max(1, Number.parseInt(String(req.query.pageSize ?? "50"), 10) || 50));
+  const where: Prisma.DeviceWhereInput = search ? { OR: [{ name: { contains: search, mode: "insensitive" } }, { model: { contains: search, mode: "insensitive" } }, { child: { fullName: { contains: search, mode: "insensitive" } } }] } : {};
+  const [total, devices] = await Promise.all([
+    prisma.device.count({ where }),
+    prisma.device.findMany({ where, orderBy: { updatedAt: "desc" }, skip: (page - 1) * pageSize, take: pageSize, select: { id: true, name: true, model: true, platform: true, osVersion: true, appVersion: true, status: true, lastSeen: true, isAuthorized: true, batteryLevel: true, isCharging: true, storageUsed: true, storageTotal: true, memoryUsed: true, memoryTotal: true, createdAt: true, updatedAt: true, school: { select: { id: true, name: true } }, child: { select: { id: true, fullName: true } }, owner: { select: { fullName: true, email: true } } } }),
+  ]);
+  res.json({ page, pageSize, total, devices });
+}));
+
+app.patch("/api/platform/devices/:deviceId/revoke", authenticate, requirePlatformAdmin, asyncRoute(async (req, res) => {
+  const deviceId = req.params.deviceId.toString();
+  const existing = await prisma.device.findUnique({ where: { id: deviceId }, select: { id: true } });
+  if (!existing) { res.status(404).json({ error: "Device not found" }); return; }
+  await prisma.$transaction(async transaction => {
+    await transaction.device.update({ where: { id: deviceId }, data: { isAuthorized: false, status: "OFFLINE", fcmToken: null, deviceSecretHash: null } });
+    await transaction.deviceRegistration.updateMany({ where: { deviceId }, data: { authorized: false } });
+    await transaction.deviceLinkToken.deleteMany({ where: { deviceId } });
+    await transaction.auditLog.create({ data: { actorId: req.principal!.id, action: "platform.device.revoke", entityType: "device", entityId: deviceId } });
+  });
+  res.json({ revoked: true });
+}));
+
+app.get("/api/platform/activity", authenticate, requirePlatformAdmin, asyncRoute(async (_req, res) => {
+  const [auditLogs, deviceEvents] = await Promise.all([
+    prisma.auditLog.findMany({ orderBy: { createdAt: "desc" }, take: 100, include: { actor: { select: { fullName: true, email: true, role: true } } } }),
+    prisma.deviceActivityEvent.findMany({ orderBy: { createdAt: "desc" }, take: 100, include: { child: { select: { id: true, fullName: true } }, device: { select: { id: true, name: true, platform: true } } } }),
+  ]);
+  res.json({ auditLogs, deviceEvents });
+}));
+
+app.get("/api/platform/firestore-data", authenticate, requirePlatformAdmin, asyncRoute(async (req, res) => {
+  const collections = ["announcements", "attendance", "behavior_reports", "feedback", "homework", "homework_submissions", "results", "subscriptions", "link_requests"] as const;
+  const collection = typeof req.query.collection === "string" ? req.query.collection : "";
+  if (!collections.includes(collection as typeof collections[number])) { res.status(400).json({ error: "Unsupported app data collection" }); return; }
+  const limit = Math.min(200, Math.max(1, Number.parseInt(String(req.query.limit ?? "100"), 10) || 100));
+  const records = await prisma.legacyRecord.findMany({ where: { collection }, orderBy: { createdAt: "desc" }, take: limit });
+  res.json({ collection, count: records.length, rows: records.map(record => ({ id: record.sourceId, data: record.data })) });
+}));
+
+app.get("/api/platform/security", authenticate, requirePlatformAdmin, asyncRoute(async (_req, res) => {
+  const now = new Date();
+  const dayAgo = new Date(now.getTime() - 24 * 60 * 60_000);
+  const [inactiveUsers, unverifiedUsers, suspendedSchools, unauthorizedOnlineDevices, expiredInvitations, recentSecurityAudit] = await Promise.all([
+    prisma.user.count({ where: { isActive: false } }),
+    prisma.user.count({ where: { emailVerified: false } }),
+    prisma.school.count({ where: { isActive: false } }),
+    prisma.device.count({ where: { isAuthorized: false, status: "ONLINE" } }),
+    prisma.schoolInvitation.count({ where: { usedAt: null, expiresAt: { lt: now } } }),
+    prisma.auditLog.findMany({ where: { createdAt: { gte: dayAgo }, OR: [ { action: { contains: "auth", mode: "insensitive" } }, { action: { contains: "account", mode: "insensitive" } }, { action: { contains: "device", mode: "insensitive" } }, { action: { contains: "user", mode: "insensitive" } }, { action: { contains: "school", mode: "insensitive" } } ] }, orderBy: { createdAt: "desc" }, take: 100, include: { actor: { select: { fullName: true, email: true, role: true } } } }),
+  ]);
+  res.json({ generatedAt: now.toISOString(), counts: { inactiveUsers, unverifiedUsers, suspendedSchools, unauthorizedOnlineDevices, expiredInvitations }, recentSecurityAudit });
+}));
+
+app.post("/api/auth/sync", (_req, res) => res.status(410).json({ error: "Firebase identity sync is retired. Sign in with the PostgreSQL API." }));
+
 app.post("/api/admin/users", authenticate, allow(Role.ADMIN), asyncRoute(async (req, res) => {
-  const input = z.object({ firebaseUid: z.string().min(1), email: z.string().email(), fullName: z.string().trim().min(1).max(160), role: z.enum(["PARENT", "TEACHER"]), phone: z.string().max(40).optional(), schoolId: z.string().optional() }).safeParse(req.body);
+  const input = z.object({ firebaseUid: z.string().min(1).optional(), email: z.string().email(), password: z.string().min(10).max(128), fullName: z.string().trim().min(1).max(160), role: z.enum(["PARENT", "TEACHER"]), phone: z.string().max(40).optional(), schoolId: z.string().optional() }).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
   const value = input.data;
   const schoolId = value.schoolId ?? req.principal!.schoolId ?? undefined;
   if (req.principal!.schoolId && schoolId !== req.principal!.schoolId) { res.status(403).json({ error: "School is outside your authorized scope" }); return; }
-  const user = await prisma.user.upsert({ where: { firebaseUid: value.firebaseUid }, create: { firebaseUid: value.firebaseUid, email: value.email, fullName: value.fullName, phone: value.phone, role: value.role, schoolId }, update: { email: value.email, fullName: value.fullName, phone: value.phone, role: value.role, schoolId } });
+  const normalizedEmail = value.email.trim().toLowerCase();
+  const existing = await prisma.user.findUnique({ where: { email: normalizedEmail } });
+  const user = existing
+    ? await prisma.user.update({ where: { id: existing.id }, data: { fullName: value.fullName, phone: value.phone, emailVerified: true, role: value.role, schoolId, ...(!existing.passwordHash ? { passwordHash: hashPassword(value.password) } : {}) } })
+    : await prisma.user.create({ data: { firebaseUid: value.firebaseUid ?? `pg_${randomBytes(20).toString("hex")}`, email: normalizedEmail, passwordHash: hashPassword(value.password), fullName: value.fullName, phone: value.phone, emailVerified: true, role: value.role, schoolId } });
   await prisma.auditLog.create({ data: { actorId: req.principal!.id, action: "user.provision", entityType: "user", entityId: user.id, details: { role: user.role, schoolId: user.schoolId } } });
   res.status(201).json({ id: user.id, role: user.role });
 }));
@@ -192,13 +979,37 @@ app.patch("/api/me", authenticate, asyncRoute(async (req, res) => {
   const { preferences, premiumExpiry, ...fields } = input.data;
   const user = await prisma.user.update({ where: { id: req.principal!.id }, data: { ...fields, ...(preferences ? { preferences: preferences as Prisma.InputJsonValue } : {}), ...(premiumExpiry !== undefined ? { premiumExpiry: premiumExpiry ? new Date(premiumExpiry) : null } : {}) } });
   await prisma.auditLog.create({ data: { actorId: req.principal!.id, action: "user.profile_update", entityType: "user", entityId: user.id } });
-  res.json({ user });
+  res.json({ user: publicUser(user) });
 }));
 
 app.delete("/api/me", authenticate, asyncRoute(async (req, res) => {
-  const id = req.principal!.id;
+  const { id, firebaseUid } = req.principal!;
+  const firebaseUidHash = createHash("sha256").update(firebaseUid).digest("hex");
   await prisma.$transaction(async transaction => {
-    await transaction.auditLog.create({ data: { action: "user.account_delete", entityType: "user", entityId: id } });
+    await transaction.deletedAuthIdentity.upsert({ where: { firebaseUidHash }, create: { firebaseUidHash }, update: {} });
+    await transaction.emailOtpVerification.deleteMany({ where: { email: req.principal!.email.toLowerCase() } });
+
+    const registrations = await transaction.deviceRegistration.findMany({ where: { actorId: id }, select: { deviceId: true } });
+    await transaction.deviceRegistration.deleteMany({ where: { actorId: id } });
+    await transaction.deviceLinkToken.deleteMany({ where: { actorId: id } });
+    for (const { deviceId } of registrations) {
+      const remaining = await transaction.deviceRegistration.count({ where: { deviceId, authorized: true } });
+      if (!remaining) await transaction.device.updateMany({ where: { id: deviceId, ownerId: null }, data: { isAuthorized: false, status: "OFFLINE", fcmToken: null, deviceSecretHash: null } });
+    }
+
+    const ownedDevices = await transaction.device.findMany({ where: { ownerId: id }, select: { id: true, childId: true } });
+    for (const device of ownedDevices) {
+      const otherAuthorizedRegistration = await transaction.deviceRegistration.count({ where: { deviceId: device.id, actorId: { not: id }, authorized: true } });
+      if (!device.childId) {
+        await transaction.device.delete({ where: { id: device.id } });
+      } else if (otherAuthorizedRegistration) {
+        await transaction.device.update({ where: { id: device.id }, data: { ownerId: null } });
+      } else {
+        await transaction.device.update({ where: { id: device.id }, data: { ownerId: null, isAuthorized: false, status: "OFFLINE", fcmToken: null, deviceSecretHash: null } });
+      }
+    }
+
+    await transaction.auditLog.create({ data: { action: "user.account_delete", entityType: "user", details: { firebaseUidHash } } });
     await transaction.user.delete({ where: { id } });
   });
   res.status(204).end();
@@ -269,7 +1080,7 @@ app.get("/api/children", authenticate, asyncRoute(async (req, res) => {
 }));
 
 app.post("/api/children", authenticate, allow(Role.ADMIN, Role.TEACHER, Role.PARENT), asyncRoute(async (req, res) => {
-  const input = z.object({ id: z.string().min(1).max(200), fullName: z.string().trim().min(1).max(160), schoolId: z.string().optional(), className: z.string().max(80).optional() }).safeParse(req.body);
+  const input = z.object({ id: z.string().min(1).max(200), childCode: z.string().min(4).max(128).optional(), fullName: z.string().trim().min(1).max(160), schoolId: z.string().optional(), className: z.string().max(80).optional() }).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
   const user = req.principal!;
   let schoolId: string | undefined;
@@ -288,24 +1099,89 @@ app.post("/api/children", authenticate, allow(Role.ADMIN, Role.TEACHER, Role.PAR
   const schoolClass = schoolId && input.data.className
     ? await prisma.schoolClass.findFirst({ where: { schoolId, name: input.data.className }, select: { id: true } })
     : null;
-  const child = await prisma.child.upsert({ where: { id: input.data.id }, create: { id: input.data.id, fullName: input.data.fullName, schoolId, className: input.data.className, classId: schoolClass?.id }, update: { fullName: input.data.fullName, schoolId, className: input.data.className, classId: schoolClass?.id } });
+  const child = await prisma.child.upsert({ where: { id: input.data.id }, create: { id: input.data.id, linkCode: input.data.childCode, fullName: input.data.fullName, schoolId, className: input.data.className, classId: schoolClass?.id }, update: { linkCode: input.data.childCode, fullName: input.data.fullName, schoolId, className: input.data.className, classId: schoolClass?.id } });
   if (user.role === Role.PARENT) await prisma.parentChild.upsert({ where: { parentId_childId: { parentId: user.id, childId: child.id } }, create: { parentId: user.id, childId: child.id }, update: {} });
   if (user.role === Role.TEACHER) await prisma.teacherStudent.upsert({ where: { teacherId_studentId: { teacherId: user.id, studentId: child.id } }, create: { teacherId: user.id, studentId: child.id }, update: {} });
   await prisma.auditLog.create({ data: { actorId: user.id, action: "child.register", entityType: "child", entityId: child.id } });
   res.status(201).json({ child });
 }));
 
+app.post("/api/children/link", authenticate, allow(Role.PARENT), asyncRoute(async (req, res) => {
+  const input = z.object({ childCode: z.string().trim().min(4).max(128), childName: z.string().trim().min(1).max(160) }).safeParse(req.body);
+  if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
+  const child = await prisma.child.findFirst({ where: { linkCode: input.data.childCode, fullName: { equals: input.data.childName, mode: "insensitive" }, isActive: true } });
+  if (!child) { res.status(404).json({ error: "Child not found. Check the pairing code and name." }); return; }
+  await prisma.parentChild.upsert({ where: { parentId_childId: { parentId: req.principal!.id, childId: child.id } }, create: { parentId: req.principal!.id, childId: child.id }, update: {} });
+  await prisma.auditLog.create({ data: { actorId: req.principal!.id, action: "child.link_by_code", entityType: "child", entityId: child.id } });
+  res.json({ child });
+}));
+
+app.post("/api/children/link-requests", authenticate, allow(Role.PARENT), asyncRoute(async (req, res) => {
+  const input = z.object({ childId: z.string().min(1), childName: z.string().trim().min(1).max(160) }).safeParse(req.body);
+  if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
+  const child = await prisma.child.findUnique({ where: { id: input.data.childId } });
+  if (!child || child.fullName.toLowerCase() !== input.data.childName.toLowerCase()) { res.status(404).json({ error: "Child profile not found" }); return; }
+  const sourceId = `link_${randomBytes(18).toString("hex")}`;
+  await prisma.legacyRecord.create({ data: { collection: "link_requests", sourceId, data: { parentId: req.principal!.firebaseUid, parentDatabaseId: req.principal!.id, parentName: req.principal!.fullName, childId: child.id, childName: child.fullName, schoolId: child.schoolId, status: "pending", createdAt: new Date().toISOString() } } });
+  res.status(201).json({ requestId: sourceId, status: "pending" });
+}));
+
+app.get("/api/admin/children/link-requests", authenticate, allow(Role.ADMIN), asyncRoute(async (req, res) => {
+  const rows = await prisma.legacyRecord.findMany({ where: { collection: "link_requests" }, orderBy: { createdAt: "desc" }, take: 300 });
+  const requests = rows.filter(row => {
+    const data = objectData(row.data);
+    return data.status === "pending" && (!req.principal!.schoolId || data.schoolId === req.principal!.schoolId);
+  }).map(row => ({ id: row.sourceId, ...objectData(row.data) }));
+  res.json({ requests });
+}));
+
+app.post("/api/admin/children/link-requests/:requestId/approve", authenticate, allow(Role.ADMIN, Role.TEACHER), asyncRoute(async (req, res) => {
+  const requestId = req.params.requestId.toString();
+  const row = await prisma.legacyRecord.findUnique({ where: { collection_sourceId: { collection: "link_requests", sourceId: requestId } } });
+  if (!row) { res.status(404).json({ error: "Link request not found" }); return; }
+  const data = objectData(row.data);
+  if (req.principal!.schoolId && data.schoolId !== req.principal!.schoolId) { res.status(403).json({ error: "Request is outside your school" }); return; }
+  if (data.status !== "pending" || typeof data.childId !== "string") { res.status(409).json({ error: "Request is no longer pending" }); return; }
+  if (req.principal!.role === Role.TEACHER && !await canAccessChild(req.principal!, data.childId)) { res.status(403).json({ error: "Child is outside your authorized scope" }); return; }
+  const parentDatabaseId = typeof data.parentDatabaseId === "string" ? data.parentDatabaseId : typeof data.parentId === "string" ? (await prisma.user.findUnique({ where: { firebaseUid: data.parentId }, select: { id: true } }))?.id : undefined;
+  if (!parentDatabaseId) { res.status(409).json({ error: "Requesting parent account is unavailable" }); return; }
+  const childId = data.childId;
+  const parent = await prisma.user.findUnique({ where: { id: parentDatabaseId }, select: { isActive: true } });
+  const child = await prisma.child.findUnique({ where: { id: childId }, select: { id: true } });
+  if (!parent?.isActive || !child) { res.status(409).json({ error: "Parent or child profile is no longer active" }); return; }
+  await prisma.$transaction([
+    prisma.parentChild.upsert({ where: { parentId_childId: { parentId: parentDatabaseId, childId } }, create: { parentId: parentDatabaseId, childId }, update: {} }),
+    prisma.legacyRecord.update({ where: { collection_sourceId: { collection: "link_requests", sourceId: requestId } }, data: { data: { ...data, parentDatabaseId, status: "approved", reviewedBy: req.principal!.firebaseUid, reviewedAt: new Date().toISOString() } as Prisma.InputJsonValue } }),
+    prisma.auditLog.create({ data: { actorId: req.principal!.id, action: "child.link_request.approve", entityType: "child", entityId: childId } }),
+  ]);
+  res.json({ approved: true });
+}));
+
 app.delete("/api/children/:childId/link", authenticate, allow(Role.PARENT, Role.TEACHER), asyncRoute(async (req, res) => {
   const childId = req.params.childId.toString();
-  if (!await canAccessChild(req.principal!, childId)) { res.status(404).json({ error: "Child not found in your authorized scope" }); return; }
-  if (req.principal!.role === Role.PARENT) await prisma.parentChild.delete({ where: { parentId_childId: { parentId: req.principal!.id, childId } } });
-  else await prisma.teacherStudent.delete({ where: { teacherId_studentId: { teacherId: req.principal!.id, studentId: childId } } });
-  await prisma.auditLog.create({ data: { actorId: req.principal!.id, action: "child.unlink", entityType: "child", entityId: childId } });
+  const user = req.principal!;
+  if (!await canAccessChild(user, childId)) { res.status(404).json({ error: "Child not found in your authorized scope" }); return; }
+  await prisma.$transaction(async transaction => {
+    if (user.role === Role.PARENT) await transaction.parentChild.delete({ where: { parentId_childId: { parentId: user.id, childId } } });
+    else await transaction.teacherStudent.delete({ where: { teacherId_studentId: { teacherId: user.id, studentId: childId } } });
+
+    await transaction.deviceLinkToken.deleteMany({ where: { actorId: user.id, childId } });
+    const registrations = await transaction.deviceRegistration.findMany({ where: { actorId: user.id, device: { childId } }, select: { deviceId: true } });
+    await transaction.deviceRegistration.deleteMany({ where: { actorId: user.id, device: { childId } } });
+    const ownedDevices = await transaction.device.findMany({ where: { childId, ownerId: user.id }, select: { id: true } });
+    const affectedDeviceIds = new Set([...registrations.map(row => row.deviceId), ...ownedDevices.map(row => row.id)]);
+    for (const deviceId of affectedDeviceIds) {
+      const remaining = await transaction.deviceRegistration.count({ where: { deviceId, authorized: true } });
+      if (remaining) await transaction.device.updateMany({ where: { id: deviceId, ownerId: user.id }, data: { ownerId: null } });
+      else await transaction.device.updateMany({ where: { id: deviceId, OR: [{ ownerId: user.id }, { ownerId: null }] }, data: { ownerId: null, isAuthorized: false, status: "OFFLINE", fcmToken: null, deviceSecretHash: null } });
+    }
+    await transaction.auditLog.create({ data: { actorId: user.id, action: "child.unlink", entityType: "child", entityId: childId } });
+  });
   res.status(204).end();
 }));
 
 app.post("/api/device-links", authenticate, allow(Role.ADMIN, Role.TEACHER, Role.PARENT), asyncRoute(async (req, res) => {
-  const input = z.object({ childId: z.string().min(1), validForMinutes: z.number().int().min(1).max(60).default(30) }).safeParse(req.body);
+  const input = z.object({ childId: z.string().min(1), validForMinutes: z.number().int().min(1).max(60).default(10) }).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
   const user = req.principal!;
   if (!await canAccessChild(user, input.data.childId)) { res.status(403).json({ error: "Child is outside your authorized scope" }); return; }
@@ -320,7 +1196,7 @@ app.post("/api/device-links", authenticate, allow(Role.ADMIN, Role.TEACHER, Role
 }));
 
 // A one-use, short-lived QR token authorizes a child device to pair without a child account.
-app.post("/api/device-links/register", asyncRoute(async (req, res) => {
+app.post("/api/device-links/register", authenticate, allow(Role.ADMIN, Role.TEACHER, Role.PARENT), asyncRoute(async (req, res) => {
   const input = z.object({ token: z.string().min(20).max(200), deviceKey: z.string().min(1).max(200), deviceSecret: z.string().min(24).max(200), platform: z.enum(["ANDROID", "IOS", "WINDOWS", "MACOS", "WEB"]), name: z.string().min(1).max(120), model: z.string().max(120).optional(), osVersion: z.string().max(120).optional() }).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
   const value = input.data;
@@ -328,7 +1204,15 @@ app.post("/api/device-links/register", asyncRoute(async (req, res) => {
   const device = await prisma.$transaction(async transaction => {
     const now = new Date();
     const link = await transaction.deviceLinkToken.findUnique({ where: { tokenHash } });
-    if (!link || link.usedAt || link.expiresAt <= now) return null;
+    if (!link || link.usedAt || link.expiresAt <= now || link.actorId !== req.principal!.id) return null;
+    const actor = await transaction.user.findUnique({ where: { id: link.actorId }, select: { id: true, role: true, schoolId: true, isActive: true, firebaseUid: true } });
+    if (!actor?.isActive) return null;
+    const childAccess = actor.role === Role.PARENT
+      ? await transaction.parentChild.findUnique({ where: { parentId_childId: { parentId: actor.id, childId: link.childId } }, select: { parentId: true } })
+      : actor.role === Role.TEACHER
+        ? await transaction.teacherStudent.findUnique({ where: { teacherId_studentId: { teacherId: actor.id, studentId: link.childId } }, select: { teacherId: true } })
+        : await transaction.child.findFirst({ where: { id: link.childId, ...(actor.schoolId ? { schoolId: actor.schoolId } : {}) }, select: { id: true } });
+    if (!childAccess) return null;
     const claimed = await transaction.deviceLinkToken.updateMany({ where: { tokenHash, usedAt: null, expiresAt: { gt: now } }, data: { usedAt: now } });
     if (!claimed.count) return null;
     const child = await transaction.child.findUnique({ where: { id: link.childId }, select: { schoolId: true } });
@@ -336,11 +1220,10 @@ app.post("/api/device-links/register", asyncRoute(async (req, res) => {
     const result = await transaction.device.create({ data: { deviceKey: value.deviceKey, childId: link.childId, schoolId: child.schoolId, ownerId: link.actorId, platform: value.platform, name: value.name, model: value.model, osVersion: value.osVersion, deviceSecretHash: createHash("sha256").update(value.deviceSecret).digest("hex"), status: "ONLINE", isAuthorized: true, lastSeen: new Date() } });
     await transaction.deviceRegistration.create({ data: { deviceId: result.id, actorId: link.actorId, authorized: true } });
     await transaction.deviceLinkToken.update({ where: { tokenHash }, data: { deviceId: result.id } });
-    const owner = await transaction.user.findUnique({ where: { id: link.actorId }, select: { firebaseUid: true } });
-    return { device: result, childId: link.childId, ownerFirebaseUid: owner?.firebaseUid };
+    return { device: result, childId: link.childId, ownerId: actor.id };
   });
   if (!device) { res.status(410).json({ error: "Pairing token is invalid, expired, or already used" }); return; }
-  res.status(201).json({ id: device.device.id, childId: device.childId, parentFirebaseUid: device.ownerFirebaseUid, status: device.device.status });
+  res.status(201).json({ id: device.device.id, childId: device.childId, parentId: device.ownerId, status: device.device.status });
 }));
 
 app.post("/api/device-events", asyncRoute(async (req, res) => {
@@ -457,6 +1340,7 @@ app.post("/api/notifications/broadcast", authenticate, allow(Role.ADMIN, Role.TE
   const recipients = recipientWhere.length ? await prisma.user.findMany({ where: { isActive: true, OR: recipientWhere }, select: { id: true } }) : [];
   if (!recipients.length) { res.json({ created: 0 }); return; }
   const rows = await prisma.notification.createManyAndReturn({ data: recipients.map(({ id }) => ({ recipientId: id, childId, title, body, type, payload: payload as Prisma.InputJsonValue })) });
+  await prisma.auditLog.create({ data: { actorId: req.principal!.id, action: "notification.broadcast", entityType: "notification", details: { recipients: rows.length, roles: [...roles], schoolId: schoolId ?? null } } });
   await Promise.all(rows.map(row => deliver(row.id, row.recipientId, title, body, payload)));
   res.status(201).json({ created: rows.length });
 }));
@@ -524,7 +1408,7 @@ app.get("/api/devices", authenticate, asyncRoute(async (req, res) => {
       ? { OR: [{ ownerId: user.id }, { child: { parents: { some: { parentId: user.id } } } }] }
       : { OR: [{ ownerId: user.id }, { child: { teachers: { some: { teacherId: user.id } } } }] };
   const devices = await prisma.device.findMany({ where, orderBy: { updatedAt: "desc" } });
-  res.json({ devices: devices.map(({ fcmToken: _token, deviceKey: _deviceKey, deviceSecretHash: _secret, ...device }) => ({ ...device, userId: device.childId ?? device.ownerId, deviceName: device.name, type: device.platform.toLowerCase(), deviceModel: device.model, isActive: device.isAuthorized })) });
+  res.json({ devices: devices.map(({ fcmToken: _token, deviceKey: _deviceKey, deviceSecretHash: _secret, ...device }) => ({ ...device, userId: device.childId ?? device.ownerId, deviceName: device.name, type: device.platform.toLowerCase(), deviceModel: device.model, isActive: device.isAuthorized, canDelete: device.ownerId === user.id || (user.role === Role.ADMIN && (!user.schoolId || device.schoolId === user.schoolId)) })) });
 }));
 
 app.get("/api/devices/:deviceId", authenticate, asyncRoute(async (req, res) => {
@@ -533,7 +1417,22 @@ app.get("/api/devices/:deviceId", authenticate, asyncRoute(async (req, res) => {
   const permitted = device.childId ? await canAccessChild(req.principal!, device.childId) : device.ownerId === req.principal!.id || (req.principal!.role === Role.ADMIN && (!req.principal!.schoolId || device.schoolId === req.principal!.schoolId));
   if (!permitted) { res.status(403).json({ error: "Device is outside your authorized scope" }); return; }
   const { fcmToken: _token, deviceKey: _key, deviceSecretHash: _secret, ...safe } = device;
-  res.json({ device: { ...safe, userId: safe.childId ?? safe.ownerId, deviceName: safe.name, type: safe.platform.toLowerCase(), deviceModel: safe.model, isActive: safe.isAuthorized } });
+  const canDelete = device.ownerId === req.principal!.id || (req.principal!.role === Role.ADMIN && (!req.principal!.schoolId || device.schoolId === req.principal!.schoolId));
+  res.json({ device: { ...safe, userId: safe.childId ?? safe.ownerId, deviceName: safe.name, type: safe.platform.toLowerCase(), deviceModel: safe.model, isActive: safe.isAuthorized, canDelete } });
+}));
+
+app.delete("/api/devices/:deviceId", authenticate, asyncRoute(async (req, res) => {
+  const deviceId = req.params.deviceId.toString();
+  const device = await prisma.device.findUnique({ where: { id: deviceId }, select: { id: true, ownerId: true, schoolId: true } });
+  if (!device) { res.status(404).json({ error: "Device not found" }); return; }
+  const permitted = device.ownerId === req.principal!.id || (req.principal!.role === Role.ADMIN && (!req.principal!.schoolId || device.schoolId === req.principal!.schoolId));
+  if (!permitted) { res.status(403).json({ error: "Only the device owner or an authorized administrator can remove this device" }); return; }
+  await prisma.$transaction(async transaction => {
+    await transaction.auditLog.create({ data: { actorId: req.principal!.id, action: "device.delete", entityType: "device", entityId: device.id } });
+    await transaction.deviceLinkToken.deleteMany({ where: { deviceId: device.id } });
+    await transaction.device.delete({ where: { id: device.id } });
+  });
+  res.status(204).end();
 }));
 
 app.get("/api/children/:childId/activity", authenticate, asyncRoute(async (req, res) => {

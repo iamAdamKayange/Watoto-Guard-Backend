@@ -34,12 +34,21 @@ enum DeliveryStatus {
   SKIPPED
 }
 
+enum SchoolRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
 model User {
   id           String   @id @default(cuid())
+  // Legacy Firebase UID retained only to preserve existing cross-document links during migration.
   firebaseUid  String   @unique
+  passwordHash String?
   email        String   @unique
   fullName     String
   phone        String?
+  emailVerified Boolean @default(false)
   profileImageUrl String?
   preferences  Json     @default("{}")
   isPremium    Boolean  @default(false)
@@ -57,7 +66,34 @@ model User {
   dailySummaries DailyUsageSummary[]
   notificationPreference NotificationPreference?
   auditActor   AuditLog[] @relation("AuditActor")
+  reviewedSchoolRequests SchoolAccessRequest[] @relation("SchoolRequestReviewer")
+  sentSchoolInvitations SchoolInvitation[] @relation("SchoolInvitationCreator")
   @@index([schoolId, role])
+}
+
+// Prevent a deleted Firebase identity from being recreated by /api/auth/sync.
+// Only a one-way digest is stored; the Firebase UID remains private.
+model DeletedAuthIdentity {
+  firebaseUidHash String   @id
+  deletedAt       DateTime @default(now())
+}
+
+model EmailOtpVerification {
+  email                String   @id
+  otpHash              String
+  fullName             String
+  phone                String?
+  attempts             Int      @default(0)
+  sendsInWindow        Int      @default(0)
+  sendWindowStartedAt  DateTime @default(now())
+  sentAt               DateTime
+  expiresAt            DateTime
+  verifiedAt           DateTime?
+  registrationExpiresAt DateTime?
+  consumedAt           DateTime?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+  @@index([expiresAt])
 }
 
 model School {
@@ -80,6 +116,50 @@ model School {
   children      Child[]
   classes       SchoolClass[]
   devices       Device[]
+  accessRequests SchoolAccessRequest[]
+  invitations   SchoolInvitation[]
+}
+
+model SchoolAccessRequest {
+  id            String              @id @default(cuid())
+  contactName   String
+  email         String
+  phone         String
+  position      String
+  schoolName    String
+  schoolAddress String
+  website       String?
+  studentCount  Int?
+  message       String?
+  status        SchoolRequestStatus @default(PENDING)
+  schoolId      String?             @unique
+  reviewerId    String?
+  reviewNote    String?
+  reviewedAt    DateTime?
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+  school        School?             @relation(fields: [schoolId], references: [id], onDelete: SetNull)
+  reviewer      User?               @relation("SchoolRequestReviewer", fields: [reviewerId], references: [id], onDelete: SetNull)
+  @@index([status, createdAt])
+  @@index([email, createdAt])
+}
+
+model SchoolInvitation {
+  id          String   @id @default(cuid())
+  tokenHash   String   @unique
+  email       String
+  fullName    String
+  phone       String?
+  role        Role
+  schoolId    String
+  creatorId   String?
+  expiresAt   DateTime
+  usedAt      DateTime?
+  createdAt   DateTime @default(now())
+  school      School   @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  creator     User?    @relation("SchoolInvitationCreator", fields: [creatorId], references: [id], onDelete: SetNull)
+  @@index([schoolId, email, usedAt])
+  @@index([expiresAt])
 }
 
 model SchoolClass {
@@ -98,6 +178,7 @@ model SchoolClass {
 
 model Child {
   id        String   @id @default(cuid())
+  linkCode  String?  @unique
   fullName  String
   schoolId  String?
   classId   String?

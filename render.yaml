@@ -16,6 +16,18 @@
         value: watotoguard
       - key: FIREBASE_SERVICE_ACCOUNT_JSON
         sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM_EMAIL
+        sync: false
+      - key: OTP_HASH_SECRET
+        sync: false
+      - key: AUTH_TOKEN_SECRET
+        generateValue: true
+      - key: GOOGLE_CLIENT_IDS
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
 
 databases:
   - name: kidguard-db

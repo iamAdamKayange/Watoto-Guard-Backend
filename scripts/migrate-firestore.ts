@@ -5,9 +5,12 @@ import { DevicePlatform, DeviceStatus, Prisma, PrismaClient, Role } from "@prism
 import { createHash } from "node:crypto";
 
 const dryRun = process.argv.includes("--dry-run");
-const projectId = process.env.FIREBASE_PROJECT_ID;
-const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
-const privateKey = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n");
+const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
+  ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON) as { project_id?: string; client_email?: string; private_key?: string }
+  : undefined;
+const projectId = process.env.FIREBASE_PROJECT_ID || serviceAccount?.project_id;
+const clientEmail = process.env.FIREBASE_CLIENT_EMAIL || serviceAccount?.client_email;
+const privateKey = (process.env.FIREBASE_PRIVATE_KEY || serviceAccount?.private_key)?.replace(/\\n/g, "\n");
 if (!projectId || !clientEmail || !privateKey) throw new Error("Set FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, and FIREBASE_PRIVATE_KEY before importing.");
 if (!process.env.DATABASE_URL) throw new Error("Set DATABASE_URL to the PostgreSQL target before importing.");
 
@@ -92,7 +95,7 @@ async function main() {
     let classId = idOf(data.classId);
     if (classId && !await prisma.schoolClass.findUnique({ where: { id: classId }, select: { id: true } })) classId = undefined;
     if (!classId && exists?.id && idOf(data.className)) classId = (await prisma.schoolClass.findFirst({ where: { schoolId: exists.id, name: data.className }, select: { id: true } }))?.id;
-    await prisma.child.upsert({ where: { id: doc.id }, create: { id: doc.id, fullName: idOf(data.fullName) ?? idOf(data.name) ?? "Student", schoolId: exists?.id, classId, className: idOf(data.className), createdAt: dateOf(data.createdAt) ?? new Date(), updatedAt: dateOf(data.updatedAt) ?? new Date() }, update: { fullName: idOf(data.fullName) ?? idOf(data.name) ?? "Student", schoolId: exists?.id, classId, className: idOf(data.className), updatedAt: dateOf(data.updatedAt) ?? new Date() } });
+    await prisma.child.upsert({ where: { id: doc.id }, create: { id: doc.id, fullName: idOf(data.fullName) ?? idOf(data.name) ?? "Student", linkCode: idOf(data.linkCode) ?? idOf(data.childCode) ?? idOf(data.phone), schoolId: exists?.id, classId, className: idOf(data.className), createdAt: dateOf(data.createdAt) ?? new Date(), updatedAt: dateOf(data.updatedAt) ?? new Date() }, update: { fullName: idOf(data.fullName) ?? idOf(data.name) ?? "Student", linkCode: idOf(data.linkCode) ?? idOf(data.childCode) ?? idOf(data.phone), schoolId: exists?.id, classId, className: idOf(data.className), updatedAt: dateOf(data.updatedAt) ?? new Date() } });
   }
 
   for (const doc of userDocs.filter(user => !roleOf(user.data().role))) {
