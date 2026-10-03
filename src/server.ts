@@ -73,6 +73,12 @@ async function canAccessChild(user: Principal, childId: string) {
   return !!await prisma.teacherStudent.findUnique({ where: { teacherId_studentId: { teacherId: user.id, studentId: childId } } });
 }
 
+app.get("/", (_req, res) => res.json({
+  name: "KidGuard API",
+  status: "ok",
+  health: "/health",
+}));
+
 app.get("/health", (_req, res) => res.json({ status: "ok", service: "kidguard-api" }));
 
 app.get("/api/schools", authenticate, asyncRoute(async (req, res) => {
