@@ -1,22 +1,24 @@
-services:
+﻿services:
   - type: web
-    name: watoto-guard-notification-worker
+    name: kidguard-api
     env: node
     plan: free
-    buildCommand: npm install
-    startCommand: npm start
+    buildCommand: npm ci && npm run prisma:generate && npm run build
+    startCommand: npm run start:render
     healthCheckPath: /health
     autoDeploy: true
     envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: kidguard-db
+          property: connectionString
       - key: FIREBASE_PROJECT_ID
         value: watotoguard
-      - key: LISTENER_LOOKBACK_MINUTES
-        value: "120"
       - key: FIREBASE_SERVICE_ACCOUNT_JSON
         sync: false
-      - key: DAILY_SUMMARY_HOUR
-        value: "18"
-      - key: DAILY_SUMMARY_CHECK_MINUTES
-        value: "15"
-      - key: DAILY_SUMMARY_TZ_OFFSET_MINUTES
-        value: "180"
+
+databases:
+  - name: kidguard-db
+    databaseName: kidguard
+    user: kidguard
+    plan: free

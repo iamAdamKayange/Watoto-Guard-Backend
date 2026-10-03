@@ -1,0 +1,317 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  TEACHER
+  PARENT
+}
+
+enum DevicePlatform {
+  ANDROID
+  IOS
+  WINDOWS
+  MACOS
+  WEB
+}
+
+enum DeviceStatus {
+  ONLINE
+  OFFLINE
+  UNKNOWN
+}
+
+enum DeliveryStatus {
+  PENDING
+  SENT
+  FAILED
+  SKIPPED
+}
+
+model User {
+  id           String   @id @default(cuid())
+  firebaseUid  String   @unique
+  email        String   @unique
+  fullName     String
+  phone        String?
+  profileImageUrl String?
+  preferences  Json     @default("{}")
+  isPremium    Boolean  @default(false)
+  premiumExpiry DateTime?
+  role         Role
+  schoolId     String?
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  school       School?  @relation(fields: [schoolId], references: [id])
+  children     ParentChild[] @relation("Parent")
+  taught       TeacherStudent[] @relation("Teacher")
+  devices      Device[]
+  notifications Notification[]
+  dailySummaries DailyUsageSummary[]
+  notificationPreference NotificationPreference?
+  auditActor   AuditLog[] @relation("AuditActor")
+  @@index([schoolId, role])
+}
+
+model School {
+  id            String   @id @default(cuid())
+  name          String
+  code          String?
+  address       String?
+  phone         String?
+  email         String?
+  website       String?
+  logoUrl       String?
+  description   String?
+  motto         String?
+  principalName String?
+  isActive      Boolean  @default(true)
+  settings      Json     @default("{}")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  users         User[]
+  children      Child[]
+  classes       SchoolClass[]
+  devices       Device[]
+}
+
+model SchoolClass {
+  id           String   @id @default(cuid())
+  schoolId     String
+  name         String
+  gradeLevel   String?
+  academicYear String?
+  settings      Json     @default("{}")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  school       School  @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  children     Child[]
+  @@unique([schoolId, name])
+}
+
+model Child {
+  id        String   @id @default(cuid())
+  fullName  String
+  schoolId  String?
+  classId   String?
+  className String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  school    School?  @relation(fields: [schoolId], references: [id])
+  classroom SchoolClass? @relation(fields: [classId], references: [id])
+  parents   ParentChild[] @relation("Child")
+  teachers  TeacherStudent[] @relation("Student")
+  devices   Device[]
+  notifications Notification[]
+  activityEvents DeviceActivityEvent[]
+  locations DeviceLocation[]
+  screenTime ScreenTimeRecord[]
+  @@index([schoolId])
+}
+
+model ParentChild {
+  parentId String
+  childId  String
+  createdAt DateTime @default(now())
+  parent User @relation("Parent", fields: [parentId], references: [id], onDelete: Cascade)
+  child Child @relation("Child", fields: [childId], references: [id], onDelete: Cascade)
+  @@id([parentId, childId])
+  @@index([childId])
+}
+
+model TeacherStudent {
+  teacherId String
+  studentId String
+  createdAt DateTime @default(now())
+  teacher User @relation("Teacher", fields: [teacherId], references: [id], onDelete: Cascade)
+  student Child @relation("Student", fields: [studentId], references: [id], onDelete: Cascade)
+  @@id([teacherId, studentId])
+  @@index([studentId])
+}
+
+model Device {
+  id          String         @id @default(cuid())
+  deviceKey   String         @unique
+  childId     String?
+  schoolId    String?
+  ownerId     String?
+  platform    DevicePlatform
+  name        String
+  model       String?
+  osVersion   String?
+  appVersion  String?
+  fcmToken    String?        @unique
+  status      DeviceStatus   @default(UNKNOWN)
+  lastSeen    DateTime?
+  isAuthorized Boolean       @default(false)
+  deviceSecretHash String?
+  batteryLevel Float?
+  isCharging Boolean @default(false)
+  storageUsed Float?
+  storageTotal Float?
+  memoryUsed Float?
+  memoryTotal Float?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  child       Child?         @relation(fields: [childId], references: [id])
+  school      School?        @relation(fields: [schoolId], references: [id])
+  owner       User?          @relation(fields: [ownerId], references: [id])
+  registrations DeviceRegistration[]
+  activityEvents DeviceActivityEvent[]
+  locations DeviceLocation[]
+  screenTime ScreenTimeRecord[]
+  @@index([childId, status])
+  @@index([schoolId, status])
+  @@index([ownerId])
+}
+
+model DeviceRegistration {
+  id         String   @id @default(cuid())
+  deviceId   String
+  actorId    String
+  authorized Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  device     Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  @@index([actorId, deviceId])
+  @@unique([deviceId, actorId])
+}
+
+model DeviceLinkToken {
+  tokenHash String   @id
+  childId   String
+  actorId   String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  usedAt    DateTime?
+  deviceId  String?  @unique
+  @@index([childId, expiresAt])
+  @@index([actorId, createdAt])
+}
+
+model DeviceActivityEvent {
+  id        String   @id @default(cuid())
+  deviceId  String
+  childId   String
+  type      String
+  payload   Json     @default("{}")
+  createdAt DateTime @default(now())
+  device    Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  child     Child    @relation(fields: [childId], references: [id], onDelete: Cascade)
+  @@index([deviceId, createdAt])
+  @@index([childId, createdAt])
+  @@index([type, createdAt])
+}
+
+model DeviceLocation {
+  id        String   @id @default(cuid())
+  deviceId  String
+  childId   String
+  latitude  Float
+  longitude Float
+  altitude  Float?
+  accuracy  Float?
+  speed     Float?
+  bearing   Float?
+  address   String?
+  placeName String?
+  timestamp DateTime @default(now())
+  createdAt DateTime @default(now())
+  device    Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  child     Child    @relation(fields: [childId], references: [id], onDelete: Cascade)
+  @@index([childId, timestamp])
+  @@index([deviceId, timestamp])
+}
+
+model ScreenTimeRecord {
+  id            String   @id @default(cuid())
+  deviceId      String
+  childId       String
+  date          DateTime
+  totalMinutes  Int      @default(0)
+  unlockedCount Int      @default(0)
+  appUsage      Json     @default("{}")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  device        Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  child         Child    @relation(fields: [childId], references: [id], onDelete: Cascade)
+  @@unique([deviceId, date])
+  @@index([childId, date])
+}
+
+model DailyUsageSummary {
+  id              String   @id @default(cuid())
+  parentId        String
+  dayKey          String
+  totalMinutes    Int      @default(0)
+  topApps         Json     @default("[]")
+  childIds        Json     @default("[]")
+  deviceIds       Json     @default("[]")
+  eventCount      Int      @default(0)
+  activeDevices   Int      @default(0)
+  inactiveDevices Int      @default(0)
+  createdAt       DateTime @default(now())
+  parent          User     @relation(fields: [parentId], references: [id], onDelete: Cascade)
+  @@unique([parentId, dayKey])
+  @@index([dayKey])
+}
+
+model Notification {
+  id             String         @id @default(cuid())
+  recipientId    String
+  childId        String?
+  title          String
+  body           String
+  type           String         @default("system")
+  relatedEntity  String?
+  relatedId      String?
+  payload        Json           @default("{}")
+  isRead         Boolean        @default(false)
+  createdAt      DateTime       @default(now())
+  readAt         DateTime?
+  deliveryStatus DeliveryStatus @default(PENDING)
+  deliveryError  String?
+  deliveredAt    DateTime?
+  recipient      User           @relation(fields: [recipientId], references: [id], onDelete: Cascade)
+  child          Child?         @relation(fields: [childId], references: [id], onDelete: SetNull)
+  @@index([recipientId, createdAt])
+  @@index([recipientId, isRead])
+}
+
+model NotificationPreference {
+  userId    String   @id
+  pushEnabled Boolean @default(true)
+  types     Json     @default("{}")
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  action     String
+  entityType String
+  entityId   String?
+  details    Json     @default("{}")
+  createdAt  DateTime @default(now())
+  actor      User?    @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+  @@index([actorId, createdAt])
+}
+
+model LegacyRecord {
+  id         String   @id @default(cuid())
+  collection String
+  sourceId   String
+  data       Json
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  @@unique([collection, sourceId])
+  @@index([collection, createdAt])
+}
