@@ -306,8 +306,9 @@ app.post("/api/admin/school-access-requests/:requestId/decision", authenticate, 
         `Thank you for your interest in KidGuard. We are unable to approve ${request.schoolName}'s request at this time.${note ? ` Review note: ${note}` : ""}`,
         `<div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;padding:28px;color:#112442"><h2>Update on your KidGuard request</h2><p>Thank you for your interest. We are unable to approve ${escapeHtml(request.schoolName)}'s request at this time.</p>${note ? `<p>${escapeHtml(note)}</p>` : ""}</div>`,
       );
+      responseSent = true;
     } catch { console.error("School request decision email failed", requestId); }
-    res.json({ status: SchoolRequestStatus.REJECTED });
+    res.json({ status: SchoolRequestStatus.REJECTED, responseSent });
     return;
   }
 
@@ -359,6 +360,19 @@ app.get("/api/platform/invitations", authenticate, requirePlatformAdmin, asyncRo
   });
   res.json({ invitations });
 }));
+app.get("/api/admin/school-invitations", authenticate, allow(Role.ADMIN), asyncRoute(async (req, res) => {
+  const requestedSchoolId = typeof req.query.schoolId === "string" ? req.query.schoolId : undefined;
+  const schoolId = req.principal!.schoolId ?? requestedSchoolId;
+  if (req.principal!.schoolId && requestedSchoolId && requestedSchoolId !== req.principal!.schoolId) {
+    res.status(403).json({ error: "School is outside your authorized scope" }); return;
+  }
+  const invitations = await prisma.schoolInvitation.findMany({
+    where: { role: Role.TEACHER, ...(schoolId ? { schoolId } : {}) },
+    orderBy: { createdAt: "desc" }, take: 100,
+    select: { id: true, email: true, fullName: true, phone: true, role: true, expiresAt: true, usedAt: true, createdAt: true, school: { select: { id: true, name: true } } },
+  });
+  res.json({ invitations });
+}));
 app.post("/api/admin/school-invitations", authenticate, allow(Role.ADMIN), asyncRoute(async (req, res) => {
   const input = z.object({ email: z.string().trim().email().max(254).transform(value => value.toLowerCase()), fullName: z.string().trim().min(2).max(160), phone: z.string().trim().max(40).optional(), schoolId: z.string().optional() }).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
@@ -394,6 +408,7 @@ app.post("/api/admin/school-invitations/:invitationId/resend", authenticate, all
   const invitationId = req.params.invitationId.toString();
   const invitation = await prisma.schoolInvitation.findUnique({ where: { id: invitationId }, include: { school: { select: { id: true, name: true } } } });
   if (!invitation || (req.principal!.schoolId && req.principal!.schoolId !== invitation.schoolId)) { res.status(404).json({ error: "Invitation not found" }); return; }
+  if (req.principal!.schoolId && invitation.role !== Role.TEACHER) { res.status(404).json({ error: "Invitation not found" }); return; }
   if (invitation.usedAt) { res.status(409).json({ error: "Invitation has already been used" }); return; }
   const newToken = createInvitationToken();
   const updated = await prisma.schoolInvitation.updateMany({ where: { id: invitationId, usedAt: null }, data: { tokenHash: newToken.tokenHash, expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60_000) } });
@@ -405,6 +420,7 @@ app.post("/api/admin/school-invitations/:invitationId/resend", authenticate, all
     res.status(503).json({ error: "Email haikutumwa. Hakikisha Resend imewekwa kisha ujaribu tena." });
     return;
   }
+  await prisma.auditLog.create({ data: { actorId: req.principal!.id, action: "school_invitation.resend", entityType: "school_invitation", entityId: invitation.id, details: { role: invitation.role, schoolId: invitation.schoolId } } });
   res.json({ sent: true });
 }));
 
@@ -1112,8 +1128,22 @@ app.get("/api/admin/users", authenticate, allow(Role.ADMIN), asyncRoute(async (r
   const role = typeof req.query.role === "string" && ["ADMIN", "TEACHER", "PARENT"].includes(req.query.role) ? req.query.role as Role : undefined;
   const schoolId = typeof req.query.schoolId === "string" ? req.query.schoolId : req.principal!.schoolId ?? undefined;
   if (req.principal!.schoolId && schoolId !== req.principal!.schoolId) { res.status(403).json({ error: "School is outside your authorized scope" }); return; }
-  const users = await prisma.user.findMany({ where: { ...(role ? { role } : {}), ...(schoolId ? { schoolId } : {}), isActive: true }, include: { children: { select: { childId: true } }, taught: { select: { studentId: true } } }, orderBy: { fullName: "asc" } });
+  const includeInactive = req.query.includeInactive === "true";
+  const users = await prisma.user.findMany({ where: { ...(role ? { role } : {}), ...(schoolId ? { schoolId } : {}), ...(!includeInactive ? { isActive: true } : {}) }, include: { children: { select: { childId: true } }, taught: { select: { studentId: true } } }, orderBy: { fullName: "asc" } });
   res.json({ users: users.map(user => ({ ...publicUser(user), childrenIds: user.children.map(row => row.childId), studentIds: user.taught.map(row => row.studentId) })) });
+}));
+
+app.patch("/api/admin/users/:firebaseUid/access", authenticate, allow(Role.ADMIN), asyncRoute(async (req, res) => {
+  const input = z.object({ isActive: z.boolean() }).safeParse(req.body);
+  if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
+  const firebaseUid = req.params.firebaseUid.toString();
+  const user = await prisma.user.findUnique({ where: { firebaseUid } });
+  if (!user || user.role !== Role.TEACHER || (req.principal!.schoolId && user.schoolId !== req.principal!.schoolId)) {
+    res.status(404).json({ error: "Teacher not found in your school" }); return;
+  }
+  const updated = await prisma.user.update({ where: { id: user.id }, data: { isActive: input.data.isActive } });
+  await prisma.auditLog.create({ data: { actorId: req.principal!.id, action: input.data.isActive ? "teacher.activate" : "teacher.suspend", entityType: "user", entityId: updated.id, details: { schoolId: updated.schoolId } } });
+  res.json({ id: updated.firebaseUid, isActive: updated.isActive });
 }));
 
 app.get("/api/users/:id", authenticate, asyncRoute(async (req, res) => {
@@ -1146,11 +1176,29 @@ app.post("/api/admin/children/:childId/teachers", authenticate, allow(Role.ADMIN
     prisma.child.findUnique({ where: { id: childId } }),
     prisma.user.findUnique({ where: { firebaseUid: input.data.teacherFirebaseUid } }),
   ]);
-  if (!child || !teacher || teacher.role !== Role.TEACHER || !teacher.isActive) { res.status(404).json({ error: "Child or teacher not found" }); return; }
+  if (!child || !teacher || teacher.role !== Role.TEACHER || !teacher.isActive || !child.schoolId || child.schoolId !== teacher.schoolId) { res.status(404).json({ error: "Child or teacher not found in the same school" }); return; }
   if (req.principal!.schoolId && (child.schoolId !== req.principal!.schoolId || teacher.schoolId !== req.principal!.schoolId)) { res.status(403).json({ error: "Child or teacher is outside your school" }); return; }
   await prisma.teacherStudent.upsert({ where: { teacherId_studentId: { teacherId: teacher.id, studentId: child.id } }, create: { teacherId: teacher.id, studentId: child.id }, update: {} });
   await prisma.auditLog.create({ data: { actorId: req.principal!.id, action: "child.teacher_link", entityType: "child", entityId: child.id, details: { teacherId: teacher.id } } });
   res.json({ success: true });
+}));
+
+app.delete("/api/admin/children/:childId/teachers/:teacherFirebaseUid", authenticate, allow(Role.ADMIN), asyncRoute(async (req, res) => {
+  const childId = req.params.childId.toString();
+  const teacherFirebaseUid = req.params.teacherFirebaseUid.toString();
+  const [child, teacher] = await Promise.all([
+    prisma.child.findUnique({ where: { id: childId }, select: { id: true, schoolId: true } }),
+    prisma.user.findUnique({ where: { firebaseUid: teacherFirebaseUid }, select: { id: true, firebaseUid: true, role: true, schoolId: true } }),
+  ]);
+  if (!child || !teacher || teacher.role !== Role.TEACHER || !child.schoolId || child.schoolId !== teacher.schoolId) {
+    res.status(404).json({ error: "Child or teacher not found in the same school" }); return;
+  }
+  if (req.principal!.schoolId && (child.schoolId !== req.principal!.schoolId || teacher.schoolId !== req.principal!.schoolId)) {
+    res.status(403).json({ error: "Child or teacher is outside your school" }); return;
+  }
+  const removed = await prisma.teacherStudent.deleteMany({ where: { teacherId: teacher.id, studentId: child.id } });
+  if (removed.count) await prisma.auditLog.create({ data: { actorId: req.principal!.id, action: "child.teacher_unlink", entityType: "child", entityId: child.id, details: { teacherId: teacher.firebaseUid } } });
+  res.json({ success: true, removed: removed.count === 1 });
 }));
 
 app.get("/api/notifications", authenticate, asyncRoute(async (req, res) => {
