@@ -22,6 +22,10 @@
         sync: false
       - key: SENDLIB_API_KEY
         sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4.1-mini
       - key: OTP_HASH_SECRET
         sync: false
       - key: AUTH_TOKEN_SECRET

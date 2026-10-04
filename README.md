@@ -60,3 +60,11 @@ School leaders can submit `POST /api/school-access-requests` without registering
 Registration OTP and authenticated change-email OTP use Sendlib's `POST https://sendlib.samueltuoyo.com/api/send` template API with the `otp` slug and `code`/`name` data. Sendlib sends through a connected Gmail account; with one connected account the sender can be omitted and Sendlib uses its default. Password reset, school invitations, and school-request decision emails continue using `RESEND_API_KEY` and `RESEND_FROM_EMAIL`; use a sender address accepted by Resend. The public school request itself does not depend on Resend or OTP. The schema migration is applied by `npm run start:render`.
 
 Existing Firestore application data and the legacy Firebase Functions worker are left in place for staged migration. Do not deploy the legacy Firestore notification worker as the history backend; migrate its event producers to the API before disabling it. Runtime authentication and the admin website no longer use Firebase Authentication. FCM remains on Firebase.
+
+## KidGuard AI Guardian
+
+Configure `OPENAI_API_KEY` as a private backend environment variable in Render. `OPENAI_MODEL` defaults to `gpt-4.1-mini` and can be overridden there. Never put the key in Flutter or a checked-in env file. The Render start command runs Prisma migrations before starting the API.
+
+AI is disabled until an eligible parent, teacher, or school administrator enables it. Per-user settings and saved conversation text are stored in PostgreSQL. `Save AI Conversations` is separately OFF by default; when OFF, only the current app session carries transcript context. When ON, users can rename or delete their own saved conversations, delete all history, and are limited to 100 saved conversations and 500 messages each. Deleting an account cascades its AI settings, rate-limit rows, conversations, and messages.
+
+Chat uses the OpenAI Responses API with `store: false`. KidGuard does not persist chat text unless the user enables saved conversations. The authenticated user's prompt and only scoped, minimized records needed to answer are sent to OpenAI. OpenAI's API abuse-monitoring retention may still apply; `store: false` does not mean zero provider retention. See [OpenAI data controls](https://developers.openai.com/api/docs/guides/your-data).

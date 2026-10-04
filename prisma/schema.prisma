@@ -62,9 +62,13 @@ model User {
   children                ParentChild[]            @relation("Parent")
   taught                  TeacherStudent[]         @relation("Teacher")
   devices                 Device[]
+  safetyTerms             ChildSafetyTerm[]
   notifications           Notification[]
   dailySummaries          DailyUsageSummary[]
   notificationPreference  NotificationPreference?
+  aiGuardianSettings      AIGuardianSettings?
+  aiRateLimitBuckets      AIGuardianRateLimitBucket[]
+  aiConversations         AIConversation[]
   auditActor              AuditLog[]               @relation("AuditActor")
   reviewedSchoolRequests  SchoolAccessRequest[]    @relation("SchoolRequestReviewer")
   sentSchoolInvitations   SchoolInvitation[]       @relation("SchoolInvitationCreator")
@@ -218,8 +222,25 @@ model Child {
   activityEvents DeviceActivityEvent[]
   locations      DeviceLocation[]
   screenTime     ScreenTimeRecord[]
+  safetyTerms    ChildSafetyTerm[]
 
   @@index([schoolId])
+}
+
+model ChildSafetyTerm {
+  id             String   @id @default(cuid())
+  childId        String
+  createdById    String
+  term           String
+  normalizedTerm String
+  enabled        Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  child          Child    @relation(fields: [childId], references: [id], onDelete: Cascade)
+  createdBy      User     @relation(fields: [createdById], references: [id], onDelete: Cascade)
+
+  @@unique([childId, normalizedTerm])
+  @@index([childId, enabled])
 }
 
 model ParentChild {
@@ -335,6 +356,7 @@ model DeviceLocation {
   placeName String?
   timestamp DateTime @default(now())
   createdAt DateTime @default(now())
+  retentionClass String?
   device    Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
   child     Child    @relation(fields: [childId], references: [id], onDelete: Cascade)
 
@@ -393,11 +415,70 @@ model Notification {
   deliveryStatus DeliveryStatus @default(PENDING)
   deliveryError  String?
   deliveredAt    DateTime?
+  priority       String         @default("NORMAL")
+  voiceEnabled   Boolean        @default(false)
+  requiresVoiceAlert Boolean    @default(false)
+  voiceCategory  String         @default("GENERAL")
   recipient      User           @relation(fields: [recipientId], references: [id], onDelete: Cascade)
   child          Child?         @relation(fields: [childId], references: [id], onDelete: SetNull)
 
   @@index([recipientId, createdAt])
   @@index([recipientId, isRead])
+}
+
+model AIGuardianSettings {
+  userId                       String   @id
+  enabled                      Boolean  @default(false)
+  voiceEnabled                 Boolean  @default(true)
+  voiceNotificationsEnabled    Boolean  @default(true)
+  highAlertsEnabled            Boolean  @default(false)
+  criticalAlertsEnabled        Boolean  @default(true)
+  normalNotificationsEnabled   Boolean  @default(false)
+  schoolNotificationsEnabled   Boolean  @default(false)
+  homeworkNotificationsEnabled Boolean  @default(false)
+  behaviorAlertsEnabled        Boolean  @default(true)
+  safetyAlertsEnabled          Boolean  @default(true)
+  saveConversations             Boolean  @default(false)
+  language                     String   @default("sw")
+  voiceCategories              Json     @default("{}")
+  createdAt                    DateTime @default(now())
+  updatedAt                    DateTime @updatedAt
+  user                         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model AIConversation {
+  id        String                @id @default(cuid())
+  userId    String
+  title     String                @default("Mazungumzo mapya")
+  createdAt DateTime              @default(now())
+  updatedAt DateTime              @updatedAt
+  user      User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages  AIConversationMessage[]
+
+  @@index([userId, updatedAt])
+}
+
+model AIConversationMessage {
+  id             String        @id @default(cuid())
+  conversationId String
+  role           String
+  content        String        @db.Text
+  createdAt      DateTime      @default(now())
+  conversation   AIConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, createdAt])
+}
+
+model AIGuardianRateLimitBucket {
+  id         String   @id @default(cuid())
+  userId     String
+  bucketStart DateTime
+  requests   Int      @default(0)
+  createdAt  DateTime @default(now())
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, bucketStart])
+  @@index([bucketStart])
 }
 
 model NotificationPreference {
