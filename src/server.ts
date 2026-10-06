@@ -7,7 +7,7 @@ import { Prisma, PrismaClient, Role, SchoolRequestStatus } from "@prisma/client"
 import { OAuth2Client } from "google-auth-library";
 import { z } from "zod";
 import { createHash, createHmac, randomBytes, randomInt, scryptSync, timingSafeEqual } from "node:crypto";
-import { sendSendlibOtpEmail } from "./sendlib";
+import { sendSendlibEmail, sendSendlibOtpEmail } from "./sendlib";
 import { AI_MAX_REQUESTS_PER_MINUTE, buildConversationWindow, canUseAiGuardian, classifyNotificationVoice, classifySafetyVoice, cleanContextText, ownedConversationWhere, requestOpenAi, validateChatMessages } from "./ai_guardian";
 
 const prisma = new PrismaClient();
@@ -25,8 +25,6 @@ const firebaseServiceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
 const firebaseProjectId = process.env.FIREBASE_PROJECT_ID || firebaseServiceAccount?.project_id;
 const firebaseClientEmail = process.env.FIREBASE_CLIENT_EMAIL || firebaseServiceAccount?.client_email;
 const firebasePrivateKey = process.env.FIREBASE_PRIVATE_KEY || firebaseServiceAccount?.private_key;
-const resendApiKey = process.env.RESEND_API_KEY;
-const resendFromEmail = process.env.RESEND_FROM_EMAIL;
 const sendlibApiKey = process.env.SENDLIB_API_KEY;
 const otpHashSecret = process.env.OTP_HASH_SECRET;
 const authTokenSecret = process.env.AUTH_TOKEN_SECRET;
@@ -197,38 +195,9 @@ function hashEmailOtp(email: string, code: string) {
   return createHmac("sha256", otpHashSecret).update(`${email}:${code}`).digest("hex");
 }
 
-async function sendEmailOtp(email: string, code: string) {
-  if (!resendApiKey || !resendFromEmail) throw new Error("Resend is not configured");
-  const response = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    signal: AbortSignal.timeout(10_000),
-    headers: { Authorization: `Bearer ${resendApiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      from: resendFromEmail,
-      to: [email],
-      subject: "KidGuard email verification code",
-      text: `Your KidGuard verification code is ${code}. It expires in 10 minutes. If you did not request this code, ignore this email.`,
-      html: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:28px;color:#112442"><h2>Verify your KidGuard email</h2><p>Enter this code in the app to finish creating your account:</p><p style="font-size:32px;letter-spacing:8px;font-weight:bold;color:#1769e0">${code}</p><p>This code expires in 10 minutes. If you did not request it, ignore this email.</p></div>`,
-    }),
-  });
-  if (!response.ok) {
-    console.error("Resend email request failed", response.status);
-    throw new Error("Verification email could not be sent");
-  }
-}
-
 async function sendTransactionalEmail(email: string, subject: string, text: string, html: string) {
-  if (!resendApiKey || !resendFromEmail) throw new Error("Resend is not configured");
-  const response = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    signal: AbortSignal.timeout(10_000),
-    headers: { Authorization: `Bearer ${resendApiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ from: resendFromEmail, to: [email], subject, text, html }),
-  });
-  if (!response.ok) {
-    console.error("Resend transactional email failed", response.status);
-    throw new Error("Email could not be sent");
-  }
+  if (!sendlibApiKey) throw new Error("Sendlib is not configured");
+  await sendSendlibEmail({ apiKey: sendlibApiKey, to: email, subject, text, html });
 }
 
 function createInvitationToken() {
@@ -245,8 +214,10 @@ async function emailSchoolInvitation(email: string, schoolName: string, role: Ro
   const safeSchoolName = escapeHtml(schoolName);
   const subject = `Invitation to join ${schoolName} on KidGuard`;
   const text = `You have been invited to join ${schoolName} on KidGuard as a ${roleLabel}. Open KidGuard, choose Join with school invitation, and enter this one-time code: ${token}. The code expires in 7 days. If you were not expecting this invitation, ignore this email.`;
-  const html = `<div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;padding:28px;color:#112442"><h2>Join ${safeSchoolName} on KidGuard</h2><p>You were invited as a ${roleLabel}. In KidGuard, choose <b>Join with school invitation</b> and enter this one-time code:</p><p style="font-size:20px;letter-spacing:2px;font-weight:bold;word-break:break-all;color:#1769e0">${token}</p><p>This invitation expires in 7 days. Ignore this email if you were not expecting it.</p></div>`;
-  await sendTransactionalEmail(email, subject, text, html);
+  const safeToken = escapeHtml(token);
+  const html = `<div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;padding:28px;color:#112442"><h2>Join ${safeSchoolName} on KidGuard</h2><p>You were invited as a ${roleLabel}. In KidGuard, choose <b>Join with school invitation</b> and enter this one-time code:</p><p style="font-size:20px;letter-spacing:2px;font-weight:bold;word-break:break-all;color:#1769e0">${safeToken}</p><p>This invitation expires in 7 days. Ignore this email if you were not expecting it.</p></div>`;
+  if (!sendlibApiKey) throw new Error("Sendlib is not configured");
+  await sendSendlibEmail({ apiKey: sendlibApiKey, to: email, subject, text, html });
 }
 
 app.post("/api/school-access-requests", asyncRoute(async (req, res) => {
@@ -402,7 +373,7 @@ app.post("/api/admin/school-invitations", authenticate, allow(Role.ADMIN), async
     await emailSchoolInvitation(input.data.email, school.name, Role.TEACHER, invitation.token);
   } catch {
     console.error("Teacher invitation delivery failed", invite.id);
-    res.status(503).json({ error: "Mwaliko umehifadhiwa lakini email haikutumwa. Kagua Resend kisha ujaribu tena.", invitationId: invite.id });
+    res.status(503).json({ error: "Mwaliko umehifadhiwa lakini email haikutumwa. Kagua SENDLIB_API_KEY na Gmail iliyounganishwa Sendlib kisha ujaribu tena.", invitationId: invite.id });
     return;
   }
   await prisma.auditLog.create({ data: { actorId: req.principal!.id, action: "school_invitation.create", entityType: "school_invitation", entityId: invite.id, details: { role: Role.TEACHER, schoolId } } });
@@ -422,7 +393,7 @@ app.post("/api/admin/school-invitations/:invitationId/resend", authenticate, all
     await emailSchoolInvitation(invitation.email, invitation.school.name, invitation.role, newToken.token);
   } catch {
     console.error("School invitation resend failed", invitation.id);
-    res.status(503).json({ error: "Email haikutumwa. Hakikisha Resend imewekwa kisha ujaribu tena." });
+    res.status(503).json({ error: "Email haikutumwa. Hakikisha SENDLIB_API_KEY na Gmail iliyounganishwa Sendlib zimewekwa kisha ujaribu tena." });
     return;
   }
   await prisma.auditLog.create({ data: { actorId: req.principal!.id, action: "school_invitation.resend", entityType: "school_invitation", entityId: invitation.id, details: { role: invitation.role, schoolId: invitation.schoolId } } });
@@ -456,10 +427,10 @@ app.post("/api/school-invitations/claim", asyncRoute(async (req, res) => {
 app.post("/api/auth/email-otp/request", asyncRoute(async (req, res) => {
   const input = z.object({ email: z.string().email().max(254).transform(value => value.trim().toLowerCase()), fullName: z.string().trim().min(1).max(160), phone: z.string().trim().max(40).optional(), purpose: z.enum(["registration", "password_reset"]).default("registration") }).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
-  const emailProviderConfigured = input.data.purpose === "registration" ? !!sendlibApiKey : !!(resendApiKey && resendFromEmail);
+  const emailProviderConfigured = !!sendlibApiKey;
   if (!emailProviderConfigured || !otpHashSecret || Buffer.byteLength(otpHashSecret) < 32) { res.status(503).json({ error: "Email verification is not configured" }); return; }
   const { email, fullName, phone } = input.data;
-  const existingUser = await prisma.user.findUnique({ where: { email }, select: { emailVerified: true, passwordHash: true } });
+  const existingUser = await prisma.user.findUnique({ where: { email }, select: { emailVerified: true, passwordHash: true, fullName: true } });
   if (input.data.purpose === "registration" && existingUser?.emailVerified && existingUser.passwordHash) { res.status(409).json({ error: "Email is already registered" }); return; }
   if (input.data.purpose === "password_reset" && !existingUser?.passwordHash) { res.status(202).json({ sent: true, expiresInSeconds: 600, resendAfterSeconds: 60 }); return; }
   const code = randomInt(0, 1_000_000).toString().padStart(6, "0");
@@ -487,11 +458,7 @@ app.post("/api/auth/email-otp/request", asyncRoute(async (req, res) => {
   });
   if ("error" in result) { res.status(429).json(result); return; }
   try {
-    if (input.data.purpose === "registration") {
-      await sendSendlibOtpEmail({ apiKey: sendlibApiKey!, email, code, name: fullName });
-    } else {
-      await sendEmailOtp(email, code);
-    }
+    await sendSendlibOtpEmail({ apiKey: sendlibApiKey!, email, code, name: input.data.purpose === "registration" ? fullName : existingUser?.fullName ?? "KidGuard user" });
   }
   catch {
     await prisma.emailOtpVerification.updateMany({ where: { email, otpHash }, data: { expiresAt: new Date(0), sentAt: new Date(0), otpHash: randomBytes(32).toString("hex") } });

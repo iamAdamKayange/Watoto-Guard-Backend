@@ -16,10 +16,6 @@
         value: watotoguard
       - key: FIREBASE_SERVICE_ACCOUNT_JSON
         sync: false
-      - key: RESEND_API_KEY
-        sync: false
-      - key: RESEND_FROM_EMAIL
-        sync: false
       - key: SENDLIB_API_KEY
         sync: false
       - key: OPENAI_API_KEY

@@ -25,3 +25,33 @@ export async function sendSendlibOtpEmail(options: {
     throw new Error("Verification email could not be sent");
   }
 }
+
+export async function sendSendlibEmail(options: {
+  apiKey: string;
+  to: string;
+  subject: string;
+  html: string;
+  text: string;
+  fetchImpl?: typeof fetch;
+}) {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const response = await fetchImpl("https://sendlib.samueltuoyo.com/api/send", {
+    method: "POST",
+    signal: AbortSignal.timeout(10_000),
+    headers: {
+      Authorization: `Bearer ${options.apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      to: options.to,
+      subject: options.subject,
+      html: options.html,
+      text: options.text,
+    }),
+  });
+
+  if (!response.ok) {
+    console.error("SendLib transactional email request rejected", response.status);
+    throw new Error("Transactional email could not be sent");
+  }
+}

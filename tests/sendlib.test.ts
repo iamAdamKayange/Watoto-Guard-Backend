@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { sendSendlibOtpEmail } from "../src/sendlib";
+import { sendSendlibEmail, sendSendlibOtpEmail } from "../src/sendlib";
 
 const accepted = () => new Response(JSON.stringify({ success: true }), { status: 200 });
 
@@ -73,5 +73,45 @@ test("network and timeout failures are propagated without exposing message conte
       fetchImpl: async () => { throw new Error("network unavailable"); },
     }),
     { message: "network unavailable" },
+  );
+});
+
+test("school invitation email uses Sendlib custom HTML API and its connected default sender", async () => {
+  let requestUrl = "";
+  let requestInit: RequestInit | undefined;
+  await sendSendlibEmail({
+    apiKey: "test-key",
+    to: "principal@example.com",
+    subject: "Invitation to join Example School on KidGuard",
+    text: "Use invitation code in KidGuard.",
+    html: "<p>Use invitation code in KidGuard.</p>",
+    fetchImpl: async (input, init) => {
+      requestUrl = String(input);
+      requestInit = init;
+      return accepted();
+    },
+  });
+  assert.equal(requestUrl, "https://sendlib.samueltuoyo.com/api/send");
+  assert.equal(requestInit?.method, "POST");
+  assert.equal(new Headers(requestInit?.headers).get("authorization"), "Bearer test-key");
+  assert.deepEqual(JSON.parse(String(requestInit?.body)), {
+    to: "principal@example.com",
+    subject: "Invitation to join Example School on KidGuard",
+    text: "Use invitation code in KidGuard.",
+    html: "<p>Use invitation code in KidGuard.</p>",
+  });
+});
+
+test("custom Sendlib email fails safely when the provider rejects the request", async () => {
+  await assert.rejects(
+    sendSendlibEmail({
+      apiKey: "test-key",
+      to: "principal@example.com",
+      subject: "School invitation",
+      text: "Invitation",
+      html: "<p>Invitation</p>",
+      fetchImpl: async () => new Response("provider details", { status: 429 }),
+    }),
+    { message: "Transactional email could not be sent" },
   );
 });
