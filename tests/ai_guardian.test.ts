@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildConversationWindow, canUseAiGuardian, classifyNotificationVoice, classifySafetyVoice, cleanContextText, ownedConversationWhere, requestOpenAi, validateChatMessages } from "../src/ai_guardian";
+import { buildConversationWindow, canUseAiGuardian, classifyNotificationVoice, classifySafetyVoice, cleanContextText, OpenAiRequestError, ownedConversationWhere, requestOpenAi, validateChatMessages } from "../src/ai_guardian";
 
 test("AI Guardian is available only to parents, teachers and school administrators", () => {
   assert.equal(canUseAiGuardian("PARENT", null), true);
@@ -50,7 +50,16 @@ test("provider failures are surfaced without returning provider response details
   await assert.rejects(() => requestOpenAi({
     apiKey: "test-key", model: "test-model", language: "sw", messages: [{ role: "user", content: "x" }], context: {},
     fetcher: async () => new Response("secret provider body", { status: 503 }),
-  }), /status 503/);
+  }), (error: unknown) => error instanceof OpenAiRequestError && error.code === "openai_unavailable" && error.providerStatus === 503 && !error.message.includes("secret provider body"));
+});
+
+test("OpenAI provider failures expose safe categories for credential, quota and request issues", async () => {
+  for (const [status, code] of [[401, "openai_key_rejected"], [429, "openai_rate_limited"], [400, "openai_bad_request"]] as const) {
+    await assert.rejects(() => requestOpenAi({
+      apiKey: "test-key", model: "test-model", language: "en", messages: [{ role: "user", content: "Hi" }], context: {},
+      fetcher: async () => new Response("provider private response", { status }),
+    }), (error: unknown) => error instanceof OpenAiRequestError && error.code === code && error.providerStatus === status && !error.message.includes("provider private response"));
+  }
 });
 
 test("only deterministic urgent risk metadata is critical; ordinary content is not spoken", () => {

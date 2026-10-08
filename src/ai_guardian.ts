@@ -1,5 +1,12 @@
 export type ChatMessage = { role: "user" | "assistant"; content: string };
 
+export class OpenAiRequestError extends Error {
+  constructor(readonly code: string, readonly providerStatus?: number) {
+    super(code);
+    this.name = "OpenAiRequestError";
+  }
+}
+
 export const AI_MAX_HISTORY_MESSAGES = 12;
 export const AI_MAX_MESSAGE_CHARS = 1000;
 export const AI_MAX_ASSISTANT_CHARS = 3000;
@@ -79,7 +86,9 @@ export async function requestOpenAi(input: {
   language: string;
   fetcher?: typeof fetch;
 }): Promise<string> {
-  const response = await (input.fetcher ?? fetch)("https://api.openai.com/v1/responses", {
+  let response: Response;
+  try {
+    response = await (input.fetcher ?? fetch)("https://api.openai.com/v1/responses", {
     method: "POST",
     signal: AbortSignal.timeout(20_000),
     headers: { Authorization: `Bearer ${input.apiKey}`, "Content-Type": "application/json" },
@@ -90,12 +99,23 @@ export async function requestOpenAi(input: {
       instructions: `${systemInstructions(input.language)}\n\nAuthorized KidGuard context JSON:\n${JSON.stringify(input.context).slice(0, 12000)}`,
       input: input.messages.map(message => ({ role: message.role, content: [{ type: "input_text", text: message.content }] })),
     }),
-  });
-  if (!response.ok) throw new Error(`OpenAI request failed with status ${response.status}`);
-  const payload = await response.json() as { output_text?: unknown; output?: Array<{ content?: Array<{ type?: string; text?: string }> }> };
+    });
+  } catch (error) {
+    throw new OpenAiRequestError(error instanceof Error && error.name === "TimeoutError" ? "openai_timeout" : "openai_network_error");
+  }
+  if (!response.ok) {
+    const code = response.status === 401 || response.status === 403 ? "openai_key_rejected"
+      : response.status === 429 ? "openai_rate_limited"
+      : response.status === 400 ? "openai_bad_request"
+      : response.status >= 500 ? "openai_unavailable" : "openai_request_failed";
+    throw new OpenAiRequestError(code, response.status);
+  }
+  let payload: { output_text?: unknown; output?: Array<{ content?: Array<{ type?: string; text?: string }> }> };
+  try { payload = await response.json() as typeof payload; }
+  catch { throw new OpenAiRequestError("openai_invalid_response", response.status); }
   const direct = typeof payload.output_text === "string" ? payload.output_text.trim() : "";
   const extracted = payload.output?.flatMap(item => item.content ?? []).filter(item => item.type === "output_text").map(item => item.text ?? "").join("\n").trim() ?? "";
   const result = direct || extracted;
-  if (!result) throw new Error("OpenAI response did not contain text");
+  if (!result) throw new OpenAiRequestError("openai_invalid_response", response.status);
   return result.slice(0, 3000);
 }

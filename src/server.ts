@@ -8,7 +8,7 @@ import { OAuth2Client } from "google-auth-library";
 import { z } from "zod";
 import { createHash, createHmac, randomBytes, randomInt, scryptSync, timingSafeEqual } from "node:crypto";
 import { sendSendlibEmail, sendSendlibOtpEmail } from "./sendlib";
-import { AI_MAX_REQUESTS_PER_MINUTE, buildConversationWindow, canUseAiGuardian, classifyNotificationVoice, classifySafetyVoice, cleanContextText, ownedConversationWhere, requestOpenAi, validateChatMessages } from "./ai_guardian";
+import { AI_MAX_REQUESTS_PER_MINUTE, buildConversationWindow, canUseAiGuardian, classifyNotificationVoice, classifySafetyVoice, cleanContextText, OpenAiRequestError, ownedConversationWhere, requestOpenAi, validateChatMessages } from "./ai_guardian";
 
 const prisma = new PrismaClient();
 const app = express();
@@ -709,7 +709,7 @@ app.post("/api/ai/chat", authenticate, asyncRoute(async (req, res) => {
   }
   if (!messages) { res.status(400).json({ error: "Invalid conversation. Keep up to 12 messages and 6,000 characters." }); return; }
   const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) { res.status(503).json({ error: "KidGuard AI is not configured" }); return; }
+  if (!apiKey) { res.status(503).json({ error: "KidGuard AI is not configured", code: "ai_not_configured" }); return; }
   const now = new Date();
   const bucketStart = new Date(Math.floor(now.getTime() / 60_000) * 60_000);
   const bucket = await prisma.aIGuardianRateLimitBucket.upsert({
@@ -821,8 +821,19 @@ app.post("/api/ai/chat", authenticate, asyncRoute(async (req, res) => {
   try {
     answer = await requestOpenAi({ apiKey, model: process.env.OPENAI_MODEL || "gpt-4.1-mini", messages, context, language: settings.language });
   } catch (error) {
-    const status = error instanceof Error && error.message.includes("status 429") ? 503 : 502;
-    res.status(status).json({ error: "KidGuard AI haipatikani kwa sasa. Tafadhali jaribu tena." });
+    if (error instanceof OpenAiRequestError) {
+      console.error("KidGuard AI provider failure", { code: error.code, status: error.providerStatus });
+      const status = error.code === "openai_key_rejected" || error.code === "openai_bad_request" ? 503 : 502;
+      const errorText = error.code === "openai_key_rejected" ? "OpenAI credentials were rejected"
+        : error.code === "openai_rate_limited" ? "OpenAI quota or rate limit reached"
+        : error.code === "openai_bad_request" ? "OpenAI rejected the model request"
+        : error.code === "openai_network_error" || error.code === "openai_timeout" ? "OpenAI network request failed"
+        : "OpenAI returned an unavailable or invalid response";
+      res.status(status).json({ error: errorText, code: error.code });
+      return;
+    }
+    console.error("KidGuard AI request failed", { category: error instanceof Error ? error.name : "unknown" });
+    res.status(502).json({ error: "KidGuard AI haipatikani kwa sasa. Tafadhali jaribu tena.", code: "openai_request_failed" });
     return;
   }
   if (shouldPersist && userMessage) {
@@ -1300,7 +1311,7 @@ app.post("/api/me/email-otp/verify", authenticate, asyncRoute(async (req, res) =
 }));
 
 app.patch("/api/me", authenticate, asyncRoute(async (req, res) => {
-  const input = z.object({ fullName: z.string().trim().min(1).max(160).optional(), phone: z.string().max(40).nullable().optional(), profileImageUrl: z.string().url().nullable().optional(), preferences: z.record(z.unknown()).optional(), isPremium: z.boolean().optional(), premiumExpiry: z.string().datetime().nullable().optional() }).safeParse(req.body);
+  const input = z.object({ fullName: z.string().trim().min(1).max(160).optional(), phone: z.string().max(40).nullable().optional(), profileImageUrl: z.string().url().nullable().optional(), preferences: z.record(z.unknown()).optional(), isPremium: z.boolean().optional(), premiumExpiry: z.string().datetime().nullable().optional() }).strict().safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
   if ((input.data.isPremium !== undefined || input.data.premiumExpiry !== undefined) && req.principal!.role !== Role.ADMIN) { res.status(403).json({ error: "Premium status requires administrator authorization" }); return; }
   const { preferences, premiumExpiry, ...fields } = input.data;
