@@ -19,15 +19,9 @@
       - key: SENDLIB_API_KEY
         sync: false
       - key: AI_ASSISTANT_HOST
-        fromService:
-          name: kidguard-ai-assistant
-          type: pserv
-          property: hostport
+        value: https://kidguard-ai-assistant.onrender.com
       - key: AI_ASSISTANT_SHARED_SECRET
-        fromService:
-          name: kidguard-ai-assistant
-          type: pserv
-          envVarKey: AI_ASSISTANT_SHARED_SECRET
+        sync: false
       - key: OTP_HASH_SECRET
         sync: false
       - key: AUTH_TOKEN_SECRET
@@ -37,7 +31,7 @@
       - key: CORS_ORIGINS
         sync: false
 
-  - type: pserv
+  - type: web
     name: kidguard-ai-assistant
     repo: https://github.com/iamAdamKayange/kidguard-ai-assistant.git
     env: python
@@ -51,7 +45,7 @@
       - key: GEMINI_MODEL
         value: gemini-3.5-flash-lite
       - key: AI_ASSISTANT_SHARED_SECRET
-        generateValue: true
+        sync: false
 
 databases:
   - name: kidguard-db

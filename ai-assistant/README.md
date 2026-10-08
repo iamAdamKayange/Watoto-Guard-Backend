@@ -1,10 +1,10 @@
 ﻿# KidGuard AI Assistant
 
-Private FastAPI service used by the KidGuard Node backend. It receives already-authorized, bounded context from Node and does not connect to PostgreSQL.
+FastAPI Web Service used by the KidGuard Node backend. It receives already-authorized, bounded context from Node and does not connect to PostgreSQL.
 
 ## Deploy on Render
 
-Create a **Private Service** from this repository in the same Render region as `kidguard-api`.
+Deploy this repository as a **Web Service** named `kidguard-ai-assistant`.
 
 - Build command: `pip install -r requirements.txt`
 - Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
@@ -12,9 +12,9 @@ Create a **Private Service** from this repository in the same Render region as `
 - Required environment variables: `GEMINI_API_KEY` and `AI_ASSISTANT_SHARED_SECRET`
 - Optional: `GEMINI_MODEL` (defaults to `gemini-3.5-flash-lite`)
 
-Set `AI_ASSISTANT_SHARED_SECRET` to the same random value on this service and the Node backend. Keep both secrets in Render environment settings; do not put them in Flutter or commit them to Git.
+Set `AI_ASSISTANT_SHARED_SECRET` to the same random value on this service and `kidguard-api`. Set `AI_ASSISTANT_HOST=https://kidguard-ai-assistant.onrender.com` on `kidguard-api`. Keep secrets in Render environment settings; do not put them in Flutter or commit them to Git.
 
-After deployment, set `AI_ASSISTANT_HOST` on `kidguard-api` to this service's internal `host:port` address, and set the same shared secret there. The health endpoint is private and should be checked from the Render private network.
+The public health endpoint is `https://kidguard-ai-assistant.onrender.com/health`. Node sends authenticated requests to `/v1/answer` using the `X-KidGuard-AI-Secret` header.
 
 ## Local development
 
