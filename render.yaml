@@ -39,8 +39,8 @@
 
   - type: pserv
     name: kidguard-ai-assistant
+    repo: https://github.com/iamAdamKayange/kidguard-ai-assistant.git
     env: python
-    rootDir: ai-assistant
     plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
