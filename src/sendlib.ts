@@ -1,5 +1,6 @@
 export async function sendSendlibOtpEmail(options: {
   apiKey: string;
+  from?: string;
   email: string;
   code: string;
   name: string;
@@ -14,6 +15,7 @@ export async function sendSendlibOtpEmail(options: {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
+      ...(options.from?.trim() ? { from: options.from.trim() } : {}),
       template: "otp",
       to: options.email,
       data: { code: options.code, name: options.name },
@@ -28,6 +30,7 @@ export async function sendSendlibOtpEmail(options: {
 
 export async function sendSendlibEmail(options: {
   apiKey: string;
+  from?: string;
   to: string;
   subject: string;
   html: string;
@@ -43,6 +46,7 @@ export async function sendSendlibEmail(options: {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
+      ...(options.from?.trim() ? { from: options.from.trim() } : {}),
       to: options.to,
       subject: options.subject,
       html: options.html,

@@ -29,6 +29,22 @@ test("registration OTP uses Sendlib's documented OTP template request", async ()
   });
 });
 
+test("configured KidGuard sender display name is passed to Sendlib OTP requests", async () => {
+  let payload: Record<string, unknown> | undefined;
+  await sendSendlibOtpEmail({
+    apiKey: "test-key",
+    from: "KidGuard <kidguard@example.com>",
+    email: "new-user@example.com",
+    code: "012345",
+    name: "New User",
+    fetchImpl: async (_input, init) => {
+      payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return accepted();
+    },
+  });
+  assert.equal(payload?.from, "KidGuard <kidguard@example.com>");
+});
+
 test("change-email OTP uses the same Sendlib OTP template with the recipient's name", async () => {
   let payload: Record<string, unknown> | undefined;
   await sendSendlibOtpEmail({
@@ -100,6 +116,23 @@ test("school invitation email uses Sendlib custom HTML API and its connected def
     text: "Use invitation code in KidGuard.",
     html: "<p>Use invitation code in KidGuard.</p>",
   });
+});
+
+test("configured KidGuard sender display name is passed to transactional email requests", async () => {
+  let payload: Record<string, unknown> | undefined;
+  await sendSendlibEmail({
+    apiKey: "test-key",
+    from: "KidGuard <kidguard@example.com>",
+    to: "principal@example.com",
+    subject: "School invitation",
+    text: "Invitation",
+    html: "<p>Invitation</p>",
+    fetchImpl: async (_input, init) => {
+      payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return accepted();
+    },
+  });
+  assert.equal(payload?.from, "KidGuard <kidguard@example.com>");
 });
 
 test("custom Sendlib email fails safely when the provider rejects the request", async () => {

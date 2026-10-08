@@ -26,6 +26,7 @@ const firebaseProjectId = process.env.FIREBASE_PROJECT_ID || firebaseServiceAcco
 const firebaseClientEmail = process.env.FIREBASE_CLIENT_EMAIL || firebaseServiceAccount?.client_email;
 const firebasePrivateKey = process.env.FIREBASE_PRIVATE_KEY || firebaseServiceAccount?.private_key;
 const sendlibApiKey = process.env.SENDLIB_API_KEY;
+const sendlibFromEmail = process.env.SENDLIB_FROM_EMAIL;
 const otpHashSecret = process.env.OTP_HASH_SECRET;
 const authTokenSecret = process.env.AUTH_TOKEN_SECRET;
 const googleClientIds = (process.env.GOOGLE_CLIENT_IDS ?? "").split(",").map(value => value.trim()).filter(Boolean);
@@ -197,7 +198,7 @@ function hashEmailOtp(email: string, code: string) {
 
 async function sendTransactionalEmail(email: string, subject: string, text: string, html: string) {
   if (!sendlibApiKey) throw new Error("Sendlib is not configured");
-  await sendSendlibEmail({ apiKey: sendlibApiKey, to: email, subject, text, html });
+  await sendSendlibEmail({ apiKey: sendlibApiKey, from: sendlibFromEmail, to: email, subject, text, html });
 }
 
 function createInvitationToken() {
@@ -217,7 +218,7 @@ async function emailSchoolInvitation(email: string, schoolName: string, role: Ro
   const safeToken = escapeHtml(token);
   const html = `<div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;padding:28px;color:#112442"><h2>Join ${safeSchoolName} on KidGuard</h2><p>You were invited as a ${roleLabel}. In KidGuard, choose <b>Join with school invitation</b> and enter this one-time code:</p><p style="font-size:20px;letter-spacing:2px;font-weight:bold;word-break:break-all;color:#1769e0">${safeToken}</p><p>This invitation expires in 7 days. Ignore this email if you were not expecting it.</p></div>`;
   if (!sendlibApiKey) throw new Error("Sendlib is not configured");
-  await sendSendlibEmail({ apiKey: sendlibApiKey, to: email, subject, text, html });
+  await sendSendlibEmail({ apiKey: sendlibApiKey, from: sendlibFromEmail, to: email, subject, text, html });
 }
 
 app.post("/api/school-access-requests", asyncRoute(async (req, res) => {
@@ -458,7 +459,7 @@ app.post("/api/auth/email-otp/request", asyncRoute(async (req, res) => {
   });
   if ("error" in result) { res.status(429).json(result); return; }
   try {
-    await sendSendlibOtpEmail({ apiKey: sendlibApiKey!, email, code, name: input.data.purpose === "registration" ? fullName : existingUser?.fullName ?? "KidGuard user" });
+    await sendSendlibOtpEmail({ apiKey: sendlibApiKey!, from: sendlibFromEmail, email, code, name: input.data.purpose === "registration" ? fullName : existingUser?.fullName ?? "KidGuard user" });
   }
   catch {
     await prisma.emailOtpVerification.updateMany({ where: { email, otpHash }, data: { expiresAt: new Date(0), sentAt: new Date(0), otpHash: randomBytes(32).toString("hex") } });
@@ -1335,7 +1336,7 @@ app.post("/api/me/email-otp/request", authenticate, asyncRoute(async (req, res) 
   }
   if ("error" in result) { res.status(429).json(result); return; }
   try {
-    await sendSendlibOtpEmail({ apiKey: sendlibApiKey, email, code, name: req.principal!.fullName });
+    await sendSendlibOtpEmail({ apiKey: sendlibApiKey, from: sendlibFromEmail, email, code, name: req.principal!.fullName });
   } catch {
     await prisma.emailChangeVerification.updateMany({ where: { userId, email, otpHash }, data: { expiresAt: new Date(0), sentAt: new Date(0), otpHash: randomBytes(32).toString("hex") } });
     res.status(503).json({ error: "Could not send the verification email. Try again shortly" }); return;
