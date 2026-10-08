@@ -710,7 +710,13 @@ app.post("/api/ai/chat", authenticate, asyncRoute(async (req, res) => {
   if (!messages) { res.status(400).json({ error: "Invalid conversation. Keep up to 12 messages and 6,000 characters." }); return; }
   const aiServiceHost = process.env.AI_ASSISTANT_HOST;
   const aiServiceSecret = process.env.AI_ASSISTANT_SHARED_SECRET;
-  if (!aiServiceHost || !aiServiceSecret) { res.status(503).json({ error: "KidGuard AI is not configured", code: "ai_not_configured" }); return; }
+  if (!aiServiceHost || !aiServiceSecret) {
+    console.error("KidGuard AI configuration is incomplete", {
+      assistantHostConfigured: Boolean(aiServiceHost),
+      sharedSecretConfigured: Boolean(aiServiceSecret),
+    });
+    res.status(503).json({ error: "KidGuard AI is not configured", code: "ai_not_configured" }); return;
+  }
   const aiServiceUrl = /^https?:\/\//i.test(aiServiceHost) ? aiServiceHost : `http://${aiServiceHost}`;
   const now = new Date();
   const bucketStart = new Date(Math.floor(now.getTime() / 60_000) * 60_000);
