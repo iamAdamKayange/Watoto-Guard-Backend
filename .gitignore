@@ -1,3 +1,6 @@
 node_modules/
 dist/
 .env
+ai-assistant/.venv/
+ai-assistant/__pycache__/
+ai-assistant/*.py[cod]

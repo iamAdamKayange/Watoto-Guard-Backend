@@ -8,7 +8,7 @@ import { OAuth2Client } from "google-auth-library";
 import { z } from "zod";
 import { createHash, createHmac, randomBytes, randomInt, scryptSync, timingSafeEqual } from "node:crypto";
 import { sendSendlibEmail, sendSendlibOtpEmail } from "./sendlib";
-import { AI_MAX_REQUESTS_PER_MINUTE, buildConversationWindow, canUseAiGuardian, classifyNotificationVoice, classifySafetyVoice, cleanContextText, OpenAiRequestError, ownedConversationWhere, requestOpenAi, validateChatMessages } from "./ai_guardian";
+import { AI_MAX_REQUESTS_PER_MINUTE, boundAiContext, buildConversationWindow, canUseAiGuardian, classifyAiQuestionIntent, classifyNotificationVoice, classifySafetyVoice, cleanContextText, AiAssistantRequestError, ownedConversationWhere, requestAiAssistant, validateChatMessages } from "./ai_guardian";
 
 const prisma = new PrismaClient();
 const app = express();
@@ -708,8 +708,10 @@ app.post("/api/ai/chat", authenticate, asyncRoute(async (req, res) => {
     messages = validateChatMessages(req.body?.messages);
   }
   if (!messages) { res.status(400).json({ error: "Invalid conversation. Keep up to 12 messages and 6,000 characters." }); return; }
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) { res.status(503).json({ error: "KidGuard AI is not configured", code: "ai_not_configured" }); return; }
+  const aiServiceHost = process.env.AI_ASSISTANT_HOST;
+  const aiServiceSecret = process.env.AI_ASSISTANT_SHARED_SECRET;
+  if (!aiServiceHost || !aiServiceSecret) { res.status(503).json({ error: "KidGuard AI is not configured", code: "ai_not_configured" }); return; }
+  const aiServiceUrl = /^https?:\/\//i.test(aiServiceHost) ? aiServiceHost : `http://${aiServiceHost}`;
   const now = new Date();
   const bucketStart = new Date(Math.floor(now.getTime() / 60_000) * 60_000);
   const bucket = await prisma.aIGuardianRateLimitBucket.upsert({
@@ -722,19 +724,19 @@ app.post("/api/ai/chat", authenticate, asyncRoute(async (req, res) => {
   void prisma.aIGuardianRateLimitBucket.deleteMany({ where: { bucketStart: { lt: new Date(now.getTime() - 2 * 60 * 60_000) } } }).catch(() => undefined);
 
   // Build the model context only from records in this authenticated user's scope.
-  // Keep topic selection aware of recent user turns so short follow-ups such as
-  // “na jana?” retain the data category requested earlier in this conversation.
-  const question = messages.filter(message => message.role === "user").slice(-6).map(message => message.content).join(" ").normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
-  const summaryIntent = /\b(summary|muhtasari|overview|ripoti ya jumla)\b/.test(question);
-  const wantsLocation = summaryIntent || /\b(location|where|wapi|mahali|alipo|ramani)\b/.test(question);
-  const wantsAttendance = summaryIntent || /\b(attendance|mahudhurio|hudhuria|amekuja|hakufika|absent|present)\b/.test(question);
-  const wantsScreenTime = summaryIntent || /\b(screen.?time|usage|matumizi ya simu|muda wa simu|apps|application)\b/.test(question);
-  const wantsHomework = summaryIntent || /\b(homework|assignment|kazi za shule|kazi ya shule)\b/.test(question);
-  const wantsBehavior = summaryIntent || /\b(behavior|tabia|bully|bullying|vitisho|safety|usalama|hatari)\b/.test(question);
-  const wantsResults = summaryIntent || /\b(results?|matokeo|marks|score|grade|alama)\b/.test(question);
-  const wantsSchool = summaryIntent || /\b(school|shule|announcement|tangazo|taarifa za shule)\b/.test(question);
-  const wantsDevices = summaryIntent || /\b(device|kifaa|connected|imeunganishwa|online|offline|monitoring)\b/.test(question);
-  const wantsNotifications = /\b(notification|arifa|alert|tahadhari)\b/.test(question);
+  // Classify the recent user turns together so short follow-ups retain their topic.
+  const intent = classifyAiQuestionIntent(messages);
+  const summaryIntent = intent.summary;
+  const wantsLocation = intent.location;
+  const wantsAttendance = intent.attendance;
+  const wantsScreenTime = intent.screenTime;
+  const wantsHomework = intent.homework;
+  const wantsBehavior = intent.behavior;
+  const wantsResults = intent.results;
+  const wantsSchool = intent.school;
+  const wantsDevices = intent.devices;
+  const wantsNotifications = intent.notifications;
+  const wantsActivity = intent.activity;
   const requestedCollections = [
     ...(wantsAttendance ? ["attendance"] : []),
     ...(wantsBehavior ? ["behavior_reports"] : []),
@@ -742,7 +744,7 @@ app.post("/api/ai/chat", authenticate, asyncRoute(async (req, res) => {
     ...(wantsResults ? ["results"] : []),
     ...(wantsSchool ? ["announcements"] : []),
   ];
-  const needsScopedChildIds = wantsLocation || wantsScreenTime || wantsDevices;
+  const needsScopedChildIds = wantsLocation || wantsScreenTime || wantsDevices || wantsActivity || wantsNotifications || wantsSchool || requestedCollections.length > 0;
   const childRows = user.role === Role.PARENT
     ? await prisma.parentChild.findMany({ where: { parentId: user.id }, select: { child: { select: { id: true, fullName: true, schoolId: true } } } })
     : user.role === Role.TEACHER
@@ -764,15 +766,20 @@ app.post("/api/ai/chat", authenticate, asyncRoute(async (req, res) => {
   const screenTimes = wantsScreenTime && childIds.length ? await prisma.screenTimeRecord.findMany({
     where: { childId: { in: childIds }, date: { gte: new Date(Date.now() - 7 * 86400_000) } },
     orderBy: { date: "desc" }, distinct: ["childId", "date"], take: 70,
-    select: { childId: true, date: true, totalMinutes: true, unlockedCount: true },
+    select: { childId: true, date: true, totalMinutes: true, unlockedCount: true, appUsage: true },
   }) : [];
   const devices = wantsDevices && childIds.length ? await prisma.device.findMany({
     where: { childId: { in: childIds }, isAuthorized: true }, orderBy: { lastSeen: "desc" }, distinct: ["childId"],
     select: { childId: true, lastSeen: true },
   }) : [];
-  const recentNotificationTypes = wantsNotifications ? await prisma.notification.findMany({
-    where: { recipientId: user.id, createdAt: { gte: new Date(Date.now() - 30 * 86400_000) } }, orderBy: { createdAt: "desc" }, take: 20,
-    select: { type: true, priority: true, createdAt: true },
+  const recentNotifications = wantsNotifications ? await prisma.notification.findMany({
+    where: { recipientId: user.id, OR: [{ childId: null }, { childId: { in: childIds } }], createdAt: { gte: new Date(Date.now() - 30 * 86400_000) } }, orderBy: { createdAt: "desc" }, take: 20,
+    select: { title: true, body: true, type: true, priority: true, createdAt: true, childId: true, payload: true },
+  }) : [];
+  const recentActivity = wantsActivity && childIds.length ? await prisma.deviceActivityEvent.findMany({
+    where: { childId: { in: childIds }, createdAt: { gte: new Date(Date.now() - 7 * 86400_000) } },
+    orderBy: { createdAt: "desc" }, take: 60,
+    select: { childId: true, type: true, payload: true, createdAt: true },
   }) : [];
   const contextRecords: Array<Record<string, unknown>> = [];
   for (const collection of requestedCollections) {
@@ -811,29 +818,84 @@ app.post("/api/ai/chat", authenticate, asyncRoute(async (req, res) => {
       lastLocation: locations.find(location => location.childId === child.id)
         ? (() => { const point = locations.find(location => location.childId === child.id)!; return { place: cleanContextText(point.placeName), observedAt: point.timestamp.toISOString() }; })()
         : null,
-      recentScreenTime: screenTimes.filter(item => item.childId === child.id).slice(0, 7).map(item => ({ date: item.date.toISOString().slice(0, 10), minutes: item.totalMinutes, unlocks: item.unlockedCount })),
+      recentScreenTime: screenTimes.filter(item => item.childId === child.id).slice(0, 7).map(item => {
+        const appUsage = objectData(item.appUsage);
+        const apps = Object.entries(appUsage).flatMap(([key, raw]) => {
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+          const row = raw as Record<string, unknown>;
+          const minutes = Number(row.minutesUsed ?? row.minutes ?? 0);
+          if (!Number.isFinite(minutes) || minutes <= 0) return [];
+          const appName = cleanContextText(row.appName ?? key, 60);
+          return appName ? [{ app: appName, minutes: Math.round(minutes) }] : [];
+        }).sort((a, b) => b.minutes - a.minutes).slice(0, 5);
+        return { date: new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Nairobi", year: "numeric", month: "2-digit", day: "2-digit" }).format(item.date), minutes: item.totalMinutes, unlocks: item.unlockedCount, apps };
+      }),
       deviceStatus: (() => { const device = devices.find(item => item.childId === child.id); return device ? { status: device.lastSeen && device.lastSeen.getTime() >= Date.now() - 35 * 60_000 ? "ONLINE" : "OFFLINE", lastSeen: device.lastSeen?.toISOString() ?? null } : null; })(),
     })),
-    recentNotificationTypes: recentNotificationTypes.map(item => ({ type: item.type, priority: item.priority, createdAt: item.createdAt.toISOString() })),
+    recentNotifications: recentNotifications.map(item => {
+      const payload = objectData(item.payload);
+      const label = item.childId ? childLabels.get(item.childId) : undefined;
+      return {
+        ...(label ? { child: label } : {}),
+        title: cleanContextText(item.title, 120),
+        summary: cleanContextText(item.body, 300),
+        category: cleanContextText(item.type, 50),
+        priority: cleanContextText(item.priority, 20),
+        riskCategory: cleanContextText(payload.riskCategory, 40),
+        riskSeverity: cleanContextText(payload.riskSeverity, 20),
+        generatedReason: cleanContextText(payload.explanation, 240),
+        createdAt: item.createdAt.toISOString(),
+      };
+    }),
+    recentActivity: recentActivity.map(event => {
+      const payload = objectData(event.payload);
+      const childLabel = event.childId ? childLabels.get(event.childId) : undefined;
+      const entry: Record<string, unknown> = {
+        ...(childLabel ? { child: childLabel } : {}),
+        type: cleanContextText(event.type, 50),
+        occurredAt: event.createdAt.toISOString(),
+      };
+      if (event.type === "blocked_content") {
+        entry.riskCategory = cleanContextText(payload.riskCategory, 40) ?? "unsafe_content";
+        entry.riskSeverity = cleanContextText(payload.riskSeverity, 20);
+        entry.reason = cleanContextText(payload.explanation, 240) ?? "A configured safety rule matched.";
+      } else if (event.type === "app_usage_summary") {
+        const rows = Array.isArray(payload.apps) ? payload.apps : [];
+        entry.apps = rows.slice(0, 8).flatMap(raw => {
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+          const row = raw as Record<string, unknown>;
+          const name = cleanContextText(row.appName ?? row.packageName, 60);
+          const minutes = Number(row.minutesUsed ?? row.minutes ?? 0);
+          return name && Number.isFinite(minutes) && minutes >= 0 ? [{ app: name, minutes: Math.round(minutes) }] : [];
+        });
+      } else if (event.type === "device_heartbeat") {
+        entry.monitoringActive = payload.monitoringActive === true;
+        entry.accessibilityActive = payload.accessibilityActive === true;
+        entry.usageAccessActive = payload.usageAccessActive === true;
+      } else if (event.type === "tamper_event") {
+        entry.reason = cleanContextText(payload.message, 160) ?? "Device protection status changed.";
+      }
+      return entry;
+    }),
     records: contextRecords,
   };
   let answer: string;
   try {
-    answer = await requestOpenAi({ apiKey, model: process.env.OPENAI_MODEL || "gpt-4.1-mini", messages, context, language: settings.language });
+    answer = await requestAiAssistant({ serviceUrl: aiServiceUrl, sharedSecret: aiServiceSecret, messages, context: boundAiContext(context), language: settings.language });
   } catch (error) {
-    if (error instanceof OpenAiRequestError) {
+    if (error instanceof AiAssistantRequestError) {
       console.error("KidGuard AI provider failure", { code: error.code, status: error.providerStatus });
-      const status = error.code === "openai_key_rejected" || error.code === "openai_bad_request" ? 503 : 502;
-      const errorText = error.code === "openai_key_rejected" ? "OpenAI credentials were rejected"
-        : error.code === "openai_rate_limited" ? "OpenAI quota or rate limit reached"
-        : error.code === "openai_bad_request" ? "OpenAI rejected the model request"
-        : error.code === "openai_network_error" || error.code === "openai_timeout" ? "OpenAI network request failed"
-        : "OpenAI returned an unavailable or invalid response";
+      const status = ["assistant_auth_failed", "assistant_bad_request", "assistant_rate_limited"].includes(error.code) ? 503 : 502;
+      const errorText = error.code === "assistant_auth_failed" ? "AI assistant authentication failed"
+        : error.code === "assistant_rate_limited" ? "AI assistant quota or rate limit reached"
+        : error.code === "assistant_bad_request" ? "AI assistant rejected the request"
+        : error.code === "assistant_network_error" || error.code === "assistant_timeout" ? "AI assistant connection failed"
+        : "AI assistant returned an unavailable or invalid response";
       res.status(status).json({ error: errorText, code: error.code });
       return;
     }
     console.error("KidGuard AI request failed", { category: error instanceof Error ? error.name : "unknown" });
-    res.status(502).json({ error: "KidGuard AI haipatikani kwa sasa. Tafadhali jaribu tena.", code: "openai_request_failed" });
+    res.status(502).json({ error: "KidGuard AI haipatikani kwa sasa. Tafadhali jaribu tena.", code: "assistant_request_failed" });
     return;
   }
   if (shouldPersist && userMessage) {
@@ -1557,13 +1619,13 @@ app.delete("/api/children/:childId/link", authenticate, allow(Role.PARENT, Role.
 }));
 
 app.post("/api/device-links", authenticate, allow(Role.ADMIN, Role.TEACHER, Role.PARENT), asyncRoute(async (req, res) => {
-  const input = z.object({ childId: z.string().min(1), validForMinutes: z.number().int().min(1).max(60).default(10) }).safeParse(req.body);
+  const input = z.object({ childId: z.string().min(1), validForMinutes: z.number().int().min(1).max(120).default(120) }).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
   const user = req.principal!;
   if (!await canAccessChild(user, input.data.childId)) { res.status(403).json({ error: "Child is outside your authorized scope" }); return; }
   if (user.role === Role.PARENT) {
     const count = await prisma.device.count({ where: { child: { parents: { some: { parentId: user.id } } }, isAuthorized: true } });
-    if (count >= 3) { res.status(409).json({ error: "Parent device limit reached" }); return; }
+    if (count >= 5) { res.status(409).json({ error: "Parent device limit reached" }); return; }
   }
   const token = randomBytes(32).toString("base64url");
   const expiresAt = new Date(Date.now() + input.data.validForMinutes * 60_000);
@@ -1872,6 +1934,11 @@ app.post("/api/devices/push-token", authenticate, asyncRoute(async (req, res) =>
   const device = existing
     ? await prisma.device.update({ where: { id: existing.id }, data: fields })
     : await prisma.device.create({ data: { deviceKey: `fcm:${value.token}`, ...fields } });
+  const pendingNotifications = await prisma.notification.findMany({
+    where: { recipientId: req.principal!.id, deliveryStatus: { in: ["PENDING", "FAILED"] }, createdAt: { gte: new Date(Date.now() - 24 * 60 * 60_000) } },
+    orderBy: { createdAt: "desc" }, take: 25,
+  });
+  await Promise.all(pendingNotifications.map(row => deliver(row.id, req.principal!.id, row.title, row.body, { ...(row.payload as Record<string, unknown>), ...classifyNotificationVoice(row.type) })));
   res.json({ id: device.id });
 }));
 
@@ -2030,11 +2097,24 @@ async function deliver(id: string, recipientId: string, title: string, body: str
     return;
   }
   const tokens = (await prisma.device.findMany({ where: { ownerId: recipientId, childId: null, fcmToken: { not: null } }, select: { fcmToken: true } })).map(d => d.fcmToken!).filter(Boolean);
-  if (!tokens.length || !getApps().length) return;
+  if (!tokens.length || !getApps().length) {
+    await prisma.notification.update({ where: { id }, data: { deliveryStatus: "FAILED", deliveryError: !tokens.length ? "no_registered_push_token" : "firebase_admin_not_configured" } });
+    return;
+  }
   try {
     const voice = await prisma.notification.findUnique({ where: { id }, select: { priority: true, voiceEnabled: true, requiresVoiceAlert: true, voiceCategory: true } });
     const { getMessaging } = await import("firebase-admin/messaging");
-    const response = await getMessaging().sendEachForMulticast({ tokens, notification: { title, body }, data: { notificationId: id, ...Object.fromEntries(Object.entries(payload).map(([key, value]) => [key, typeof value === "string" ? value : JSON.stringify(value)])), priority: voice?.priority ?? "NORMAL", voiceEnabled: String(voice?.voiceEnabled ?? false), requiresVoiceAlert: String(voice?.requiresVoiceAlert ?? false), voiceCategory: voice?.voiceCategory ?? "GENERAL" } });
+    const critical = voice?.priority === "CRITICAL" || voice?.priority === "HIGH";
+    const response = await getMessaging().sendEachForMulticast({
+      tokens,
+      notification: { title, body },
+      android: {
+        priority: critical ? "high" : "normal",
+        ttl: 4 * 7 * 24 * 60 * 60 * 1000,
+        notification: { channelId: "kidguard_alerts", priority: critical ? "high" : "default", sound: "default" },
+      },
+      data: { notificationId: id, ...Object.fromEntries(Object.entries(payload).map(([key, value]) => [key, typeof value === "string" ? value : JSON.stringify(value)])), priority: voice?.priority ?? "NORMAL", voiceEnabled: String(voice?.voiceEnabled ?? false), requiresVoiceAlert: String(voice?.requiresVoiceAlert ?? false), voiceCategory: voice?.voiceCategory ?? "GENERAL" },
+    });
     const invalidTokens = response.responses.flatMap((result, index) => {
       const code = result.error?.code;
       return !result.success && (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token") ? [tokens[index]] : [];

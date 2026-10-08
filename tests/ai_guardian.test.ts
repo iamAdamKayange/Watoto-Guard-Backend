@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildConversationWindow, canUseAiGuardian, classifyNotificationVoice, classifySafetyVoice, cleanContextText, OpenAiRequestError, ownedConversationWhere, requestOpenAi, validateChatMessages } from "../src/ai_guardian";
+import { AI_MAX_CONTEXT_CHARS, boundAiContext, buildConversationWindow, canUseAiGuardian, classifyAiQuestionIntent, classifyNotificationVoice, classifySafetyVoice, cleanContextText, AiAssistantRequestError, ownedConversationWhere, requestAiAssistant, validateChatMessages } from "../src/ai_guardian";
 
 test("AI Guardian is available only to parents, teachers and school administrators", () => {
   assert.equal(canUseAiGuardian("PARENT", null), true);
@@ -32,33 +32,67 @@ test("saved follow-up context is bounded and always scoped to the selected user'
   assert.notEqual(buildConversationWindow(bulkyHistory, "Follow up"), null);
 });
 
-test("provider requests do not persist response state and extract the Responses API text", async () => {
+test("Python assistant requests send only the authenticated service payload and extract its answer", async () => {
   let requestBody: Record<string, unknown> = {};
-  const answer = await requestOpenAi({
-    apiKey: "test-key", model: "test-model", language: "sw", messages: [{ role: "user", content: "Attendance?" }], context: { attendance: [] },
+  let requestHeaders: Headers | undefined;
+  const answer = await requestAiAssistant({
+    serviceUrl: "https://ai.test", sharedSecret: "test-secret", language: "sw", messages: [{ role: "user", content: "Attendance?" }], context: { attendance: [] },
     fetcher: async (_input, init) => {
       requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
-      return new Response(JSON.stringify({ output_text: "Taarifa haipo." }), { status: 200 });
+      requestHeaders = new Headers(init?.headers);
+      return new Response(JSON.stringify({ answer: "Taarifa haipo." }), { status: 200 });
     },
   });
   assert.equal(answer, "Taarifa haipo.");
-  assert.equal(requestBody.store, false);
-  assert.equal(requestBody.model, "test-model");
+  assert.equal(requestBody.language, "sw");
+  assert.equal(requestHeaders?.get("X-KidGuard-AI-Secret"), "test-secret");
+  assert.equal(requestBody.context && typeof requestBody.context, "object");
 });
 
-test("provider failures are surfaced without returning provider response details", async () => {
-  await assert.rejects(() => requestOpenAi({
-    apiKey: "test-key", model: "test-model", language: "sw", messages: [{ role: "user", content: "x" }], context: {},
+test("Swahili and English questions select scoped screen time, activity, alerts and notification causes", () => {
+  const english = classifyAiQuestionIntent([{ role: "user", content: "How much screen time and which apps did my child use recently?" }]);
+  assert.equal(english.screenTime, true);
+  assert.equal(english.activity, true);
+  const swahili = classifyAiQuestionIntent([{ role: "user", content: "Ni arifa gani muhimu leo na kwa nini ilitolewa?" }]);
+  assert.equal(swahili.notifications, true);
+  assert.equal(swahili.activity, true);
+  const attention = classifyAiQuestionIntent([{ role: "user", content: "Are there important events I should know about?" }]);
+  assert.equal(attention.notifications, true);
+  assert.equal(attention.activity, true);
+  const followUp = classifyAiQuestionIntent([
+    { role: "user", content: "Show recent activity" },
+    { role: "assistant", content: "Here is the activity." },
+    { role: "user", content: "Na muda wa kutumia simu je?" },
+  ]);
+  assert.equal(followUp.activity, true);
+  assert.equal(followUp.screenTime, true);
+});
+
+test("context sent to Python stays within its limit while retaining authorized child records", () => {
+  const bounded = boundAiContext({
+    role: "parent",
+    children: [{ label: "Asha", recentScreenTime: [{ date: "2026-10-08", minutes: 120, apps: [{ app: "Browser", minutes: 90 }] }] }],
+    recentNotifications: Array.from({ length: 40 }, (_, index) => ({ title: `Alert ${index}`, summary: "x".repeat(300) })),
+    recentActivity: Array.from({ length: 40 }, () => ({ type: "blocked_content", reason: "x".repeat(240) })),
+    records: Array.from({ length: 60 }, () => ({ category: "attendance", subject: "x".repeat(80) })),
+  });
+  assert.ok(JSON.stringify(bounded).length <= AI_MAX_CONTEXT_CHARS);
+  assert.equal((bounded.children as Array<{ label: string }>)[0].label, "Asha");
+});
+
+test("Python assistant failures are surfaced without returning provider response details", async () => {
+  await assert.rejects(() => requestAiAssistant({
+    serviceUrl: "https://ai.test", sharedSecret: "test-secret", language: "sw", messages: [{ role: "user", content: "x" }], context: {},
     fetcher: async () => new Response("secret provider body", { status: 503 }),
-  }), (error: unknown) => error instanceof OpenAiRequestError && error.code === "openai_unavailable" && error.providerStatus === 503 && !error.message.includes("secret provider body"));
+  }), (error: unknown) => error instanceof AiAssistantRequestError && error.code === "assistant_unavailable" && error.providerStatus === 503 && !error.message.includes("secret provider body"));
 });
 
-test("OpenAI provider failures expose safe categories for credential, quota and request issues", async () => {
-  for (const [status, code] of [[401, "openai_key_rejected"], [429, "openai_rate_limited"], [400, "openai_bad_request"]] as const) {
-    await assert.rejects(() => requestOpenAi({
-      apiKey: "test-key", model: "test-model", language: "en", messages: [{ role: "user", content: "Hi" }], context: {},
+test("assistant failures expose safe categories for authentication, quota and request issues", async () => {
+  for (const [status, code] of [[401, "assistant_auth_failed"], [429, "assistant_rate_limited"], [400, "assistant_bad_request"]] as const) {
+    await assert.rejects(() => requestAiAssistant({
+      serviceUrl: "https://ai.test", sharedSecret: "test-secret", language: "en", messages: [{ role: "user", content: "Hi" }], context: {},
       fetcher: async () => new Response("provider private response", { status }),
-    }), (error: unknown) => error instanceof OpenAiRequestError && error.code === code && error.providerStatus === status && !error.message.includes("provider private response"));
+    }), (error: unknown) => error instanceof AiAssistantRequestError && error.code === code && error.providerStatus === status && !error.message.includes("provider private response"));
   }
 });
 

@@ -18,10 +18,16 @@
         sync: false
       - key: SENDLIB_API_KEY
         sync: false
-      - key: OPENAI_API_KEY
-        sync: false
-      - key: OPENAI_MODEL
-        value: gpt-4.1-mini
+      - key: AI_ASSISTANT_HOST
+        fromService:
+          name: kidguard-ai-assistant
+          type: pserv
+          property: hostport
+      - key: AI_ASSISTANT_SHARED_SECRET
+        fromService:
+          name: kidguard-ai-assistant
+          type: pserv
+          envVarKey: AI_ASSISTANT_SHARED_SECRET
       - key: OTP_HASH_SECRET
         sync: false
       - key: AUTH_TOKEN_SECRET
@@ -30,6 +36,22 @@
         sync: false
       - key: CORS_ORIGINS
         sync: false
+
+  - type: pserv
+    name: kidguard-ai-assistant
+    env: python
+    rootDir: ai-assistant
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    autoDeploy: true
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.5-flash-lite
+      - key: AI_ASSISTANT_SHARED_SECRET
+        generateValue: true
 
 databases:
   - name: kidguard-db
