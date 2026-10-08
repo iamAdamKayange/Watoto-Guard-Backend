@@ -43,6 +43,21 @@ class AssistantTests(unittest.TestCase):
                 asyncio.run(main.answer(self.request(), "wrong"))
         self.assertEqual(caught.exception.status_code, 401)
 
+    def test_trims_secret_value_from_environment_but_still_requires_exact_header(self):
+        secret = "s" * 40
+        with patch.dict(os.environ, {"AI_ASSISTANT_SHARED_SECRET": f" {secret} ", "GEMINI_API_KEY": "test-key"}), patch.object(main.genai, "Client", FakeClient):
+            result = asyncio.run(main.answer(self.request(), secret))
+            self.assertEqual(result["answer"], FakeResponse.text)
+            with self.assertRaises(HTTPException) as caught:
+                asyncio.run(main.answer(self.request(), "x" * 40))
+        self.assertEqual(caught.exception.status_code, 401)
+
+    def test_missing_gemini_key_returns_a_configuration_error_without_calling_provider(self):
+        with patch.dict(os.environ, {"AI_ASSISTANT_SHARED_SECRET": "s" * 40}, clear=True):
+            with self.assertRaises(HTTPException) as caught:
+                asyncio.run(main.answer(self.request(), "s" * 40))
+        self.assertEqual(caught.exception.status_code, 503)
+
     def test_uses_only_bounded_node_scoped_context_and_returns_answer(self):
         with patch.dict(os.environ, {"AI_ASSISTANT_SHARED_SECRET": "s" * 40, "GEMINI_API_KEY": "test-key", "GEMINI_MODEL": "test-model"}), patch.object(main.genai, "Client", FakeClient):
             result = asyncio.run(main.answer(self.request(), "s" * 40))

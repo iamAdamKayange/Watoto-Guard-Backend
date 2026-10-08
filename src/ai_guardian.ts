@@ -13,6 +13,37 @@ export const AI_MAX_ASSISTANT_CHARS = 3000;
 export const AI_MAX_TOTAL_CHARS = 6000;
 export const AI_MAX_REQUESTS_PER_MINUTE = 8;
 
+export type AiAssistantConfiguration =
+  | { ok: true; serviceUrl: string; sharedSecret: string }
+  | { ok: false; code: "ai_host_missing" | "ai_host_invalid" | "ai_secret_missing" | "ai_secret_too_short" };
+
+/** Validate deployment configuration without including secret values in errors. */
+export function resolveAiAssistantConfiguration(
+  hostValue: string | undefined,
+  secretValue: string | undefined,
+): AiAssistantConfiguration {
+  const host = hostValue?.trim();
+  const sharedSecret = secretValue?.trim();
+  if (!host) return { ok: false, code: "ai_host_missing" };
+  if (!sharedSecret) return { ok: false, code: "ai_secret_missing" };
+  if (sharedSecret.length < 32) return { ok: false, code: "ai_secret_too_short" };
+
+  let url: URL;
+  try {
+    url = new URL(/^[a-z][a-z\d+.-]*:\/\//i.test(host) ? host : `https://${host}`);
+  } catch {
+    return { ok: false, code: "ai_host_invalid" };
+  }
+  const isLocalHost = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(url.hostname);
+  if (!(["https:", "http:"].includes(url.protocol)) ||
+      (url.protocol === "http:" && !isLocalHost) ||
+      !!url.username || !!url.password || !!url.search || !!url.hash ||
+      (url.pathname !== "/" && url.pathname !== "")) {
+    return { ok: false, code: "ai_host_invalid" };
+  }
+  return { ok: true, serviceUrl: url.origin, sharedSecret };
+}
+
 export function classifySafetyVoice(riskCategory?: string, severity?: string) {
   const classified = ["self_harm", "threat", "bullying", "unsafe_content"].includes(riskCategory ?? "") && ["low", "medium", "high", "urgent"].includes(severity ?? "");
   const priority = severity === "urgent" && classified ? "CRITICAL" : classified ? "HIGH" : "NORMAL";

@@ -1,6 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AI_MAX_CONTEXT_CHARS, boundAiContext, buildConversationWindow, canUseAiGuardian, classifyAiQuestionIntent, classifyNotificationVoice, classifySafetyVoice, cleanContextText, AiAssistantRequestError, ownedConversationWhere, requestAiAssistant, validateChatMessages } from "../src/ai_guardian";
+import { AI_MAX_CONTEXT_CHARS, boundAiContext, buildConversationWindow, canUseAiGuardian, classifyAiQuestionIntent, classifyNotificationVoice, classifySafetyVoice, cleanContextText, AiAssistantRequestError, ownedConversationWhere, requestAiAssistant, resolveAiAssistantConfiguration, validateChatMessages } from "../src/ai_guardian";
+
+test("AI assistant configuration normalizes host and surrounding whitespace without exposing secrets", () => {
+  assert.deepEqual(resolveAiAssistantConfiguration(" https://kidguard-ai-assistant.onrender.com/ ", ` ${"s".repeat(40)} `), {
+    ok: true,
+    serviceUrl: "https://kidguard-ai-assistant.onrender.com",
+    sharedSecret: "s".repeat(40),
+  });
+  assert.deepEqual(resolveAiAssistantConfiguration(undefined, "s".repeat(40)), { ok: false, code: "ai_host_missing" });
+  assert.deepEqual(resolveAiAssistantConfiguration("https://ai.test", "short"), { ok: false, code: "ai_secret_too_short" });
+  assert.deepEqual(resolveAiAssistantConfiguration("http://ai.test", "s".repeat(40)), { ok: false, code: "ai_host_invalid" });
+  assert.deepEqual(resolveAiAssistantConfiguration("https://ai.test/path", "s".repeat(40)), { ok: false, code: "ai_host_invalid" });
+  assert.deepEqual(resolveAiAssistantConfiguration("http://localhost:8001", "s".repeat(40)), {
+    ok: true, serviceUrl: "http://localhost:8001", sharedSecret: "s".repeat(40),
+  });
+});
 
 test("AI Guardian is available only to parents, teachers and school administrators", () => {
   assert.equal(canUseAiGuardian("PARENT", null), true);

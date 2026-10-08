@@ -8,7 +8,7 @@ import { OAuth2Client } from "google-auth-library";
 import { z } from "zod";
 import { createHash, createHmac, randomBytes, randomInt, scryptSync, timingSafeEqual } from "node:crypto";
 import { sendSendlibEmail, sendSendlibOtpEmail } from "./sendlib";
-import { AI_MAX_REQUESTS_PER_MINUTE, boundAiContext, buildConversationWindow, canUseAiGuardian, classifyAiQuestionIntent, classifyNotificationVoice, classifySafetyVoice, cleanContextText, AiAssistantRequestError, ownedConversationWhere, requestAiAssistant, validateChatMessages } from "./ai_guardian";
+import { AI_MAX_REQUESTS_PER_MINUTE, boundAiContext, buildConversationWindow, canUseAiGuardian, classifyAiQuestionIntent, classifyNotificationVoice, classifySafetyVoice, cleanContextText, AiAssistantRequestError, ownedConversationWhere, requestAiAssistant, resolveAiAssistantConfiguration, validateChatMessages } from "./ai_guardian";
 
 const prisma = new PrismaClient();
 const app = express();
@@ -709,16 +709,15 @@ app.post("/api/ai/chat", authenticate, asyncRoute(async (req, res) => {
     messages = validateChatMessages(req.body?.messages);
   }
   if (!messages) { res.status(400).json({ error: "Invalid conversation. Keep up to 12 messages and 6,000 characters." }); return; }
-  const aiServiceHost = process.env.AI_ASSISTANT_HOST;
-  const aiServiceSecret = process.env.AI_ASSISTANT_SHARED_SECRET;
-  if (!aiServiceHost || !aiServiceSecret) {
-    console.error("KidGuard AI configuration is incomplete", {
-      assistantHostConfigured: Boolean(aiServiceHost),
-      sharedSecretConfigured: Boolean(aiServiceSecret),
-    });
+  const aiConfiguration = resolveAiAssistantConfiguration(
+    process.env.AI_ASSISTANT_HOST,
+    process.env.AI_ASSISTANT_SHARED_SECRET,
+  );
+  if (!aiConfiguration.ok) {
+    console.error("KidGuard AI configuration is invalid", { code: aiConfiguration.code });
     res.status(503).json({ error: "KidGuard AI is not configured", code: "ai_not_configured" }); return;
   }
-  const aiServiceUrl = /^https?:\/\//i.test(aiServiceHost) ? aiServiceHost : `http://${aiServiceHost}`;
+  const { serviceUrl: aiServiceUrl, sharedSecret: aiServiceSecret } = aiConfiguration;
   const now = new Date();
   const bucketStart = new Date(Math.floor(now.getTime() / 60_000) * 60_000);
   const bucket = await prisma.aIGuardianRateLimitBucket.upsert({
@@ -1802,17 +1801,40 @@ app.post("/api/device-events", asyncRoute(async (req, res) => {
     prisma.device.update({ where: { id: device.id }, data: { status: event.type === "tamper_event" ? "UNKNOWN" : "ONLINE", lastSeen: createdAt, model: z.string().max(120).optional().parse(event.payload.deviceModel) ?? device.model, osVersion: z.string().max(120).optional().parse(event.payload.osVersion) ?? device.osVersion } }),
   ]);
   if (event.type === "blocked_content" || event.type === "tamper_event") {
-    const parent = await prisma.user.findUnique({ where: { id: device.ownerId }, select: { isActive: true } });
+    const parent = await prisma.user.findUnique({ where: { id: device.ownerId }, select: { isActive: true, aiGuardianSettings: { select: { language: true } } } });
     if (parent?.isActive) {
+      const language = parent.aiGuardianSettings?.language === "en" ? "en" : "sw";
       const legacyBlockedTerm = typeof event.payload.blockedTerm === "string" ? event.payload.blockedTerm.slice(0, 160) : "unsafe content";
-      const categoryLabels: Record<string, string> = { self_harm: "possible self-harm indicator", threat: "possible threat", bullying: "possible bullying", unsafe_content: "unsafe content" };
+      const categoryLabels: Record<string, string> = language === "en"
+        ? { self_harm: "possible self-harm indicator", threat: "possible threat", bullying: "possible bullying", unsafe_content: "unsafe content" }
+        : { self_harm: "kiashiria kinachoweza kuonyesha kujidhuru", threat: "tishio linalowezekana", bullying: "unyanyasaji unaowezekana", unsafe_content: "maudhui yasiyo salama" };
+      const severityLabels: Record<string, string> = language === "en"
+        ? { low: "low", medium: "medium", high: "high", urgent: "urgent" }
+        : { low: "chini", medium: "wastani", high: "juu", urgent: "dharura" };
       const isClassifiedRisk = !!riskCategory && !!riskSeverity;
-      const title = event.type === "tamper_event" ? "Child device protection alert" : riskCategory === "unsafe_content" || (!isClassifiedRisk && event.type === "blocked_content") ? "Unsafe content blocked" : "Possible child safety concern";
+      const unsafeContent = riskCategory === "unsafe_content" || (!isClassifiedRisk && event.type === "blocked_content");
+      const title = event.type === "tamper_event"
+        ? language === "en" ? "Child device protection alert" : "Tahadhari ya ulinzi wa kifaa cha mtoto"
+        : unsafeContent
+          ? language === "en" ? "Unsafe content blocked" : "Maudhui yasiyo salama yamezuiwa"
+          : language === "en" ? "Possible child safety concern" : "Tahadhari inayoweza kuhusiana na usalama wa mtoto";
+      const protectionStatus = objectData(event.payload.protectionStatus as Prisma.JsonValue);
+      const disabledProtections = Object.entries(protectionStatus).filter(([, enabled]) => enabled === false).map(([key]) => key);
+      const protectionLabels: Record<string, string> = language === "en"
+        ? { accessibility: "Accessibility", accessibilityService: "Accessibility service", usageAccess: "Usage access", deviceAdmin: "Device administrator", overlayPermission: "Display over other apps", batteryOptimization: "Background battery permission" }
+        : { accessibility: "Ruhusa ya ufikivu", accessibilityService: "Huduma ya ufikivu", usageAccess: "Ruhusa ya matumizi", deviceAdmin: "Msimamizi wa kifaa", overlayPermission: "Kuonyesha juu ya programu nyingine", batteryOptimization: "Ruhusa ya betri ya uendeshaji wa nyuma", batteryOptimizedIgnored: "Ruhusa ya kutozuiwa na uokoaji wa betri" };
+      const localizedDisabled = disabledProtections.map(key => protectionLabels[key] ?? key).join(", ");
       const body = event.type === "tamper_event"
-        ? `${device.name}: ${typeof event.payload.message === "string" ? event.payload.message.slice(0, 300) : "Protection status changed."}`
+        ? language === "en"
+          ? `${device.name}: ${localizedDisabled ? `Protection was turned off: ${localizedDisabled}.` : "Protection status changed. Open KidGuard to review it."}`
+          : `${device.name}: ${localizedDisabled ? `Ulinzi umezimwa: ${localizedDisabled}.` : "Hali ya ulinzi imebadilika. Fungua KidGuard uikague."}`
         : isClassifiedRisk
-          ? `${device.name}: ${typeof storedPayload === "object" && "matchedTerm" in storedPayload && typeof storedPayload.matchedTerm === "string" ? `blocked “${storedPayload.matchedTerm}” — ` : ""}${categoryLabels[riskCategory!] ?? "safety"} phrase matched (${riskSeverity} signal). Review the alert in KidGuard.`
-          : `${device.name} blocked: ${legacyBlockedTerm}`;
+          ? language === "en"
+            ? `${device.name}: ${typeof storedPayload === "object" && "matchedTerm" in storedPayload && typeof storedPayload.matchedTerm === "string" ? `blocked “${storedPayload.matchedTerm}” — ` : ""}${categoryLabels[riskCategory!] ?? "safety"} phrase matched (${severityLabels[riskSeverity!] ?? riskSeverity} signal). Review the alert in KidGuard.`
+            : `${device.name}: ${typeof storedPayload === "object" && "matchedTerm" in storedPayload && typeof storedPayload.matchedTerm === "string" ? `limezuia “${storedPayload.matchedTerm}” — ` : ""}${categoryLabels[riskCategory!] ?? "ishara ya usalama"} imegunduliwa (kiashiria cha ${severityLabels[riskSeverity!] ?? riskSeverity}). Fungua KidGuard ukague tahadhari.`
+          : language === "en"
+            ? `${device.name} blocked: ${legacyBlockedTerm}`
+            : `${device.name} imezuia: ${legacyBlockedTerm}`;
       const notificationPayload = { source: event.type, deviceId: device.id, childId: device.childId, ...(event.type === "blocked_content" ? { retentionClass: "monitoring_event_v1" } : {}), ...(isClassifiedRisk ? { riskCategory, riskSeverity, ...(typeof storedPayload === "object" && "matchedTerm" in storedPayload && typeof storedPayload.matchedTerm === "string" ? { blockedTerm: storedPayload.matchedTerm } : {}) } : { blockedTerm: legacyBlockedTerm }) };
       const voiceMetadata = classifySafetyVoice(riskCategory, riskSeverity);
       const notification = await prisma.notification.create({ data: { recipientId: device.ownerId, childId: device.childId, title, body, type: event.type === "tamper_event" || (riskCategory && riskCategory !== "unsafe_content") ? "behavior" : "system", relatedEntity: "device_activity", relatedId: device.id, payload: notificationPayload, ...voiceMetadata } });
@@ -1971,6 +1993,20 @@ app.post("/api/devices/register", authenticate, asyncRoute(async (req, res) => {
   res.status(201).json({ id: device.id, status: device.status });
 }));
 
+app.patch("/api/devices/:deviceId", authenticate, asyncRoute(async (req, res) => {
+  const deviceId = req.params.deviceId.toString();
+  const input = z.object({ name: z.string().trim().min(1).max(120) }).strict().safeParse(req.body);
+  if (!input.success) { res.status(400).json({ error: "Device name must be 1–120 characters" }); return; }
+  const device = await prisma.device.findUnique({ where: { id: deviceId }, select: { id: true, ownerId: true, schoolId: true } });
+  if (!device) { res.status(404).json({ error: "Device not found" }); return; }
+  const permitted = device.ownerId === req.principal!.id ||
+    (req.principal!.role === Role.ADMIN && (!req.principal!.schoolId || device.schoolId === req.principal!.schoolId));
+  if (!permitted) { res.status(403).json({ error: "Only the device owner or an authorized administrator can edit this device" }); return; }
+  const updated = await prisma.device.update({ where: { id: deviceId }, data: { name: input.data.name }, select: { id: true, name: true, updatedAt: true } });
+  await prisma.auditLog.create({ data: { actorId: req.principal!.id, action: "device.rename", entityType: "device", entityId: deviceId } });
+  res.json({ device: updated });
+}));
+
 app.patch("/api/devices/:deviceId/status", authenticate, asyncRoute(async (req, res) => {
   const input = z.object({ status: z.enum(["ONLINE", "OFFLINE", "UNKNOWN"]), batteryLevel: z.number().min(0).max(100).optional(), isCharging: z.boolean().optional(), storageUsed: z.number().nonnegative().optional(), storageTotal: z.number().nonnegative().optional(), memoryUsed: z.number().nonnegative().optional(), memoryTotal: z.number().nonnegative().optional() }).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
@@ -1995,20 +2031,23 @@ app.get("/api/devices", authenticate, asyncRoute(async (req, res) => {
   const recentHeartbeats = childDeviceIds.length ? await prisma.deviceActivityEvent.findMany({
     where: { deviceId: { in: childDeviceIds }, type: "device_heartbeat", createdAt: { gte: heartbeatCutoff } },
     orderBy: { createdAt: "desc" },
-    take: childDeviceIds.length * 3,
+    distinct: ["deviceId"], take: childDeviceIds.length,
     select: { deviceId: true, payload: true, createdAt: true },
   }) : [];
-  const latestMonitoringHeartbeat = new Map<string, { active: boolean; at: Date }>();
+  const latestMonitoringHeartbeat = new Map<string, { active: boolean; accessibilityActive: boolean; usageAccessActive: boolean; at: Date }>();
   for (const heartbeat of recentHeartbeats) {
     if (latestMonitoringHeartbeat.has(heartbeat.deviceId)) continue;
     const payload = heartbeat.payload as Record<string, unknown>;
-    latestMonitoringHeartbeat.set(heartbeat.deviceId, { active: payload.monitoringActive === true && payload.accessibilityActive === true && payload.usageAccessActive === true, at: heartbeat.createdAt });
+    const accessibilityActive = payload.accessibilityActive === true;
+    const usageAccessActive = payload.usageAccessActive === true;
+    latestMonitoringHeartbeat.set(heartbeat.deviceId, { active: payload.monitoringActive === true && accessibilityActive && usageAccessActive, accessibilityActive, usageAccessActive, at: heartbeat.createdAt });
   }
   res.json({ devices: devices.map(({ fcmToken: _token, deviceKey: _deviceKey, deviceSecretHash: _secret, ...device }) => {
     const heartbeat = latestMonitoringHeartbeat.get(device.id);
     const recentHeartbeat = !!heartbeat && heartbeat.at >= heartbeatCutoff;
     const connected = !!device.lastSeen && device.lastSeen >= heartbeatCutoff;
-    return { ...device, ...(device.childId ? { status: connected ? "ONLINE" : "OFFLINE" } : {}), userId: device.childId ?? device.ownerId, deviceName: device.name, type: device.platform.toLowerCase(), deviceModel: device.model, isActive: device.isAuthorized, canDelete: device.ownerId === user.id || (user.role === Role.ADMIN && (!user.schoolId || device.schoolId === user.schoolId)), monitoringActive: device.childId ? recentHeartbeat && heartbeat.active : null, monitoringHeartbeatAt: device.childId && heartbeat ? heartbeat.at.toISOString() : null };
+    const monitoringState = !device.childId ? null : !recentHeartbeat ? "no_recent_heartbeat" : !heartbeat?.accessibilityActive ? "accessibility_disabled" : !heartbeat?.usageAccessActive ? "usage_access_disabled" : !heartbeat.active ? "service_stopped" : "active";
+    return { ...device, ...(device.childId ? { status: connected ? "ONLINE" : "OFFLINE" } : {}), userId: device.childId ?? device.ownerId, deviceName: device.name, type: device.platform.toLowerCase(), deviceModel: device.model, isActive: device.isAuthorized, canDelete: device.ownerId === user.id || (user.role === Role.ADMIN && (!user.schoolId || device.schoolId === user.schoolId)), monitoringActive: device.childId ? recentHeartbeat && heartbeat.active : null, monitoringState, monitoringHeartbeatAt: device.childId && heartbeat ? heartbeat.at.toISOString() : null };
   }) });
 }));
 
@@ -2021,7 +2060,13 @@ app.get("/api/devices/:deviceId", authenticate, asyncRoute(async (req, res) => {
   const canDelete = device.ownerId === req.principal!.id || (req.principal!.role === Role.ADMIN && (!req.principal!.schoolId || device.schoolId === req.principal!.schoolId));
   const heartbeatCutoff = new Date(Date.now() - 35 * 60 * 1000);
   const connected = !!safe.lastSeen && safe.lastSeen >= heartbeatCutoff;
-  res.json({ device: { ...safe, ...(safe.childId ? { status: connected ? "ONLINE" : "OFFLINE" } : {}), userId: safe.childId ?? safe.ownerId, deviceName: safe.name, type: safe.platform.toLowerCase(), deviceModel: safe.model, isActive: safe.isAuthorized, canDelete } });
+  const heartbeat = safe.childId ? await prisma.deviceActivityEvent.findFirst({ where: { deviceId: safe.id, type: "device_heartbeat", createdAt: { gte: heartbeatCutoff } }, orderBy: { createdAt: "desc" }, select: { payload: true, createdAt: true } }) : null;
+  const heartbeatPayload = heartbeat?.payload as Record<string, unknown> | undefined;
+  const accessibilityActive = heartbeatPayload?.accessibilityActive === true;
+  const usageAccessActive = heartbeatPayload?.usageAccessActive === true;
+  const monitoringActive = !!heartbeat && heartbeatPayload?.monitoringActive === true && accessibilityActive && usageAccessActive;
+  const monitoringState = !safe.childId ? null : !heartbeat ? "no_recent_heartbeat" : !accessibilityActive ? "accessibility_disabled" : !usageAccessActive ? "usage_access_disabled" : !monitoringActive ? "service_stopped" : "active";
+  res.json({ device: { ...safe, ...(safe.childId ? { status: connected ? "ONLINE" : "OFFLINE" } : {}), userId: safe.childId ?? safe.ownerId, deviceName: safe.name, type: safe.platform.toLowerCase(), deviceModel: safe.model, isActive: safe.isAuthorized, canDelete, ...(safe.childId ? { monitoringActive, monitoringState, monitoringHeartbeatAt: heartbeat?.createdAt.toISOString() ?? null } : {}) } });
 }));
 
 app.delete("/api/devices/:deviceId", authenticate, asyncRoute(async (req, res) => {
@@ -2169,6 +2214,7 @@ async function createDailyUsageSummaries() {
   }
   for (const [parentId, parentDevices] of byParent) {
     if (await prisma.dailyUsageSummary.findUnique({ where: { parentId_dayKey: { parentId, dayKey } }, select: { id: true } })) continue;
+    const language = (await prisma.aIGuardianSettings.findUnique({ where: { userId: parentId }, select: { language: true } }))?.language === "en" ? "en" : "sw";
     const monitoredDevices = parentDevices.filter(device => device.childId !== null);
     const deviceIds = monitoredDevices.map(device => device.id);
     const events = await prisma.deviceActivityEvent.findMany({ where: { deviceId: { in: deviceIds }, type: "app_usage_summary", createdAt: { gte: start, lt: end } }, orderBy: { createdAt: "desc" }, select: { deviceId: true, payload: true } });
@@ -2198,14 +2244,20 @@ async function createDailyUsageSummaries() {
     const total = Math.round(totalMinutes);
     const hours = Math.floor(total / 60);
     const minutes = total % 60;
-    const duration = hours ? `${hours}h ${minutes}m` : `${minutes}m`;
+    const duration = language === "en"
+      ? hours ? `${hours}h ${minutes}m` : `${minutes}m`
+      : hours ? `${hours} saa na dakika ${minutes}` : `dakika ${minutes}`;
     const appsText = topApps.slice(0, 3).map(item => `${item.appName} ${item.minutes}m`).join(", ");
     const active = checkIns.length;
     const inactive = Math.max(0, monitoredDevices.length - active);
-    const body = topApps.length
-      ? `Matumizi yaliyorekodiwa jana: ${duration}. Apps kuu: ${appsText}. Vifaa vilivyoripoti jana: ${active}; ambavyo havikuripoti: ${inactive}.`
-      : `Hakuna matumizi makubwa yaliyorekodiwa jana. Vifaa vilivyoripoti: ${active}; ambavyo havikuripoti: ${inactive}.`;
-    const title = "Muhtasari wa matumizi ya jana";
+    const body = language === "en"
+      ? topApps.length
+        ? `Recorded device use yesterday: ${duration}. Top apps: ${appsText}. Devices reporting: ${active}; not reporting: ${inactive}.`
+        : `No significant device use was recorded yesterday. Devices reporting: ${active}; not reporting: ${inactive}.`
+      : topApps.length
+        ? `Matumizi ya kifaa yaliyorekodiwa jana: ${duration}. Programu zilizotumika zaidi: ${appsText}. Vifaa vilivyoripoti: ${active}; ambavyo havikuripoti: ${inactive}.`
+        : `Hakuna matumizi makubwa ya kifaa yaliyorekodiwa jana. Vifaa vilivyoripoti: ${active}; ambavyo havikuripoti: ${inactive}.`;
+    const title = language === "en" ? "Yesterday's device usage summary" : "Muhtasari wa matumizi ya jana";
     try {
       const notification = await prisma.$transaction(async transaction => {
         if (await transaction.dailyUsageSummary.findUnique({ where: { parentId_dayKey: { parentId, dayKey } }, select: { id: true } })) return null;
