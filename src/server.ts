@@ -8,7 +8,8 @@ import { OAuth2Client } from "google-auth-library";
 import { z } from "zod";
 import { createHash, createHmac, randomBytes, randomInt, scryptSync, timingSafeEqual } from "node:crypto";
 import { sendSendlibEmail, sendSendlibOtpEmail } from "./sendlib";
-import { AI_MAX_REQUESTS_PER_MINUTE, boundAiContext, buildConversationWindow, canUseAiGuardian, classifyAiQuestionIntent, classifyNotificationVoice, classifySafetyVoice, cleanContextText, AiAssistantRequestError, ownedConversationWhere, requestAiAssistant, resolveAiAssistantConfiguration, validateChatMessages } from "./ai_guardian";
+import { GuardianVoiceError, guardianVoiceInputSchema, synthesizeGuardianVoice } from "./guardian_voice";
+import { AI_MAX_REQUESTS_PER_MINUTE, boundAiContext, buildConversationWindow, canUseAiGuardian, classifyAiQuestionIntent, classifyNotificationVoice, classifySafetyVoice, cleanContextText, AiAssistantRequestError, kidGuardFeatureCatalogue, ownedConversationWhere, requestAiAssistant, resolveAiAssistantConfiguration, resolveAiChildSelection, validateChatMessages } from "./ai_guardian";
 
 const prisma = new PrismaClient();
 const app = express();
@@ -39,7 +40,7 @@ if (!getApps().length && firebaseProjectId && firebaseClientEmail && firebasePri
   }) });
 }
 
-type Principal = { id: string; firebaseUid: string; role: Role; schoolId: string | null; fullName: string; email: string };
+type Principal = { id: string; firebaseUid: string; role: Role; schoolId: string | null; fullName: string; email: string; phone: string | null; emailVerified: boolean; isActive: boolean; isPremium: boolean; premiumExpiry: Date | null; preferences: Prisma.JsonValue };
 declare global { namespace Express { interface Request { principal?: Principal } } }
 
 function publicUser<T extends { id: string; firebaseUid: string; passwordHash?: string | null }>(row: T) {
@@ -633,6 +634,7 @@ app.patch("/api/ai/settings", authenticate, asyncRoute(async (req, res) => {
   const settings = await prisma.aIGuardianSettings.upsert({
     where: { userId: user.id }, create: { userId: user.id, ...parsed.data }, update: parsed.data,
   });
+  await prisma.auditLog.create({ data: { actorId: user.id, action: "ai.settings.update", entityType: "ai_settings", entityId: user.id, details: { changedFields: Object.keys(parsed.data) } } });
   res.json({ settings });
 }));
 
@@ -680,6 +682,35 @@ app.delete("/api/ai/conversations/:conversationId", authenticate, asyncRoute(asy
   const deleted = await prisma.aIConversation.deleteMany({ where: ownedConversationWhere(user.id, req.params.conversationId.toString()) });
   if (!deleted.count) { res.status(404).json({ error: "Conversation not found" }); return; }
   res.json({ deleted: true });
+}));
+
+app.post("/api/ai/tts", authenticate, asyncRoute(async (req, res) => {
+  const user = req.principal!;
+  if (!canUseAiGuardian(user.role, user.schoolId)) { res.status(403).json({ error: "AI Guardian is not available for this account" }); return; }
+  const settings = await prisma.aIGuardianSettings.findUnique({ where: { userId: user.id }, select: { enabled: true } });
+  if (!settings?.enabled) { res.status(403).json({ error: "AI Guardian is disabled" }); return; }
+  const input = guardianVoiceInputSchema.safeParse(req.body);
+  if (!input.success) { res.status(400).json({ error: "Voice text, language, voice or speech rate is invalid." }); return; }
+  const now = new Date();
+  const bucketStart = new Date(Math.floor(now.getTime() / 60_000) * 60_000);
+  const bucket = await prisma.aIGuardianRateLimitBucket.upsert({
+    where: { userId_bucketStart: { userId: user.id, bucketStart } },
+    create: { userId: user.id, bucketStart, requests: 1 },
+    update: { requests: { increment: 1 } }, select: { requests: true },
+  });
+  if (bucket.requests > AI_MAX_REQUESTS_PER_MINUTE) { res.status(429).json({ error: "Too many AI requests. Try again in a minute." }); return; }
+  void prisma.aIGuardianRateLimitBucket.deleteMany({ where: { bucketStart: { lt: new Date(now.getTime() - 2 * 60 * 60_000) } } }).catch(() => undefined);
+  try {
+    const audio = await synthesizeGuardianVoice({ key: process.env.AZURE_SPEECH_KEY, region: process.env.AZURE_SPEECH_REGION, ...input.data });
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.status(200).send(Buffer.from(audio));
+  } catch (error) {
+    const code = error instanceof GuardianVoiceError ? error.code : "voice_unavailable";
+    if (code === "voice_not_configured") console.error("Guardian Voice provider is not configured");
+    res.status(code === "voice_not_configured" ? 503 : 502).json({ error: "Guardian Voice is not available right now.", code });
+  }
 }));
 
 app.post("/api/ai/chat", authenticate, asyncRoute(async (req, res) => {
@@ -743,6 +774,11 @@ app.post("/api/ai/chat", authenticate, asyncRoute(async (req, res) => {
   const wantsDevices = intent.devices;
   const wantsNotifications = intent.notifications;
   const wantsActivity = intent.activity;
+  const wantsSettings = intent.settings;
+  const wantsProfile = intent.profile;
+  const wantsSubscription = intent.subscription;
+  const wantsLinking = intent.linking;
+  const wantsAudit = intent.audit;
   const requestedCollections = [
     ...(wantsAttendance ? ["attendance"] : []),
     ...(wantsBehavior ? ["behavior_reports"] : []),
@@ -750,43 +786,95 @@ app.post("/api/ai/chat", authenticate, asyncRoute(async (req, res) => {
     ...(wantsResults ? ["results"] : []),
     ...(wantsSchool ? ["announcements"] : []),
   ];
-  const needsScopedChildIds = wantsLocation || wantsScreenTime || wantsDevices || wantsActivity || wantsNotifications || wantsSchool || requestedCollections.length > 0;
+  const needsScopedChildIds = wantsLocation || wantsScreenTime || wantsDevices || wantsActivity || wantsNotifications || wantsSchool || wantsLinking || requestedCollections.length > 0;
   const childRows = user.role === Role.PARENT
-    ? await prisma.parentChild.findMany({ where: { parentId: user.id }, select: { child: { select: { id: true, fullName: true, schoolId: true } } } })
+    ? await prisma.parentChild.findMany({ where: { parentId: user.id }, select: { child: { select: { id: true, fullName: true, schoolId: true, className: true, school: { select: { name: true } } } } } })
     : user.role === Role.TEACHER
-      ? await prisma.teacherStudent.findMany({ where: { teacherId: user.id }, select: { student: { select: { id: true, fullName: true, schoolId: true } } } })
+      ? await prisma.teacherStudent.findMany({ where: { teacherId: user.id }, select: { student: { select: { id: true, fullName: true, schoolId: true, className: true, school: { select: { name: true } } } } } })
       : needsScopedChildIds
-        ? await prisma.child.findMany({ where: { schoolId: user.schoolId!, isActive: true }, select: { id: true, fullName: true, schoolId: true } })
+        ? await prisma.child.findMany({ where: { schoolId: user.schoolId!, isActive: true }, select: { id: true, fullName: true, schoolId: true, className: true, school: { select: { name: true } } } })
         : [];
-  const children = childRows.map((row: any) => "child" in row ? row.child : "student" in row ? row.student : row);
+  const children = childRows.map((row: any) => {
+    const child = "child" in row ? row.child : "student" in row ? row.student : row;
+    return { ...child, schoolName: child.school?.name ?? null };
+  });
   const childIds = children.map((child: { id: string }) => child.id);
-  const childLabels = new Map(children.map((child: { id: string; fullName: string }, index: number) => [child.id, cleanContextText(child.fullName.split(/\s+/)[0], 40) ?? `Mtoto ${index + 1}`]));
-  const aliases = new Set(childIds);
+  const childSelection = resolveAiChildSelection(messages, children);
+  const dataChildIds = childSelection.needsClarification ? [] : childSelection.childIds;
+  const childLabels = new Map(children.map((child: { id: string; fullName: string }, index: number) => [child.id, cleanContextText(child.fullName, 80) ?? `Mtoto ${index + 1}`]));
+  const aliases = new Set(dataChildIds);
   const scope = user.role === Role.ADMIN ? null : await legacyScope(user);
   const authorizedSchoolIds = [...new Set([user.schoolId, ...children.map((child: { schoolId: string | null }) => child.schoolId)].filter((id): id is string => !!id))];
   const schools = wantsSchool && authorizedSchoolIds.length ? await prisma.school.findMany({ where: { id: { in: authorizedSchoolIds }, isActive: true }, select: { name: true, motto: true } }) : [];
-  const locations = wantsLocation && childIds.length ? await prisma.deviceLocation.findMany({
-    where: { childId: { in: childIds } }, orderBy: { timestamp: "desc" }, distinct: ["childId"], take: 50,
+  const locations = wantsLocation && dataChildIds.length ? await prisma.deviceLocation.findMany({
+    where: { childId: { in: dataChildIds } }, orderBy: { timestamp: "desc" }, distinct: ["childId"], take: 50,
     select: { childId: true, placeName: true, timestamp: true },
   }) : [];
-  const screenTimes = wantsScreenTime && childIds.length ? await prisma.screenTimeRecord.findMany({
-    where: { childId: { in: childIds }, date: { gte: new Date(Date.now() - 7 * 86400_000) } },
+  const screenTimes = wantsScreenTime && dataChildIds.length ? await prisma.screenTimeRecord.findMany({
+    where: { childId: { in: dataChildIds }, date: { gte: new Date(Date.now() - 7 * 86400_000) } },
     orderBy: { date: "desc" }, distinct: ["childId", "date"], take: 70,
     select: { childId: true, date: true, totalMinutes: true, unlockedCount: true, appUsage: true },
   }) : [];
-  const devices = wantsDevices && childIds.length ? await prisma.device.findMany({
-    where: { childId: { in: childIds }, isAuthorized: true }, orderBy: { lastSeen: "desc" }, distinct: ["childId"],
-    select: { childId: true, lastSeen: true },
+  const devices = dataChildIds.length ? await prisma.device.findMany({
+    where: { childId: { in: dataChildIds }, isAuthorized: true }, orderBy: { lastSeen: "desc" }, take: 100,
+    select: { id: true, childId: true, name: true, platform: true, status: true, lastSeen: true, isAuthorized: true },
+  }) : [];
+  const deviceHeartbeats = wantsDevices && devices.length ? await prisma.deviceActivityEvent.findMany({
+    where: { deviceId: { in: devices.map(device => device.id) }, type: "device_heartbeat", createdAt: { gte: new Date(Date.now() - 35 * 60_000) } },
+    orderBy: { createdAt: "desc" }, distinct: ["deviceId"], take: 100,
+    select: { deviceId: true, payload: true, createdAt: true },
   }) : [];
   const recentNotifications = wantsNotifications ? await prisma.notification.findMany({
-    where: { recipientId: user.id, OR: [{ childId: null }, { childId: { in: childIds } }], createdAt: { gte: new Date(Date.now() - 30 * 86400_000) } }, orderBy: { createdAt: "desc" }, take: 20,
-    select: { title: true, body: true, type: true, priority: true, createdAt: true, childId: true, payload: true },
+    where: { recipientId: user.id, OR: [{ childId: null }, ...(dataChildIds.length ? [{ childId: { in: dataChildIds } }] : [])], createdAt: { gte: new Date(Date.now() - 30 * 86400_000) } }, orderBy: { createdAt: "desc" }, take: 20,
+    select: { title: true, body: true, type: true, priority: true, createdAt: true, childId: true, payload: true, deliveryStatus: true, deliveredAt: true, isRead: true },
   }) : [];
-  const recentActivity = wantsActivity && childIds.length ? await prisma.deviceActivityEvent.findMany({
-    where: { childId: { in: childIds }, createdAt: { gte: new Date(Date.now() - 7 * 86400_000) } },
+  const recentActivity = wantsActivity && dataChildIds.length ? await prisma.deviceActivityEvent.findMany({
+    where: { childId: { in: dataChildIds }, createdAt: { gte: new Date(Date.now() - 7 * 86400_000) } },
     orderBy: { createdAt: "desc" }, take: 60,
     select: { childId: true, type: true, payload: true, createdAt: true },
   }) : [];
+  const linkedDeviceIds = devices.map(device => device.id);
+  const auditRows = wantsAudit || wantsActivity || wantsLinking || summaryIntent
+    ? await prisma.auditLog.findMany({
+      where: { OR: [
+        { actorId: user.id },
+        ...(dataChildIds.length ? [{ entityType: "child", entityId: { in: dataChildIds } }] : []),
+        ...(linkedDeviceIds.length ? [{ entityType: "device", entityId: { in: linkedDeviceIds } }] : []),
+      ] },
+      orderBy: { createdAt: "desc" }, take: 40,
+      select: { actorId: true, action: true, entityType: true, entityId: true, createdAt: true },
+    })
+    : [];
+  const auditActions = new Set([
+    "auth.self_register", "auth.google_register", "auth.login", "auth.password_reset", "auth.password_migrated",
+    "user.profile_update", "user.email_changed", "ai.settings.update", "notification.preferences.update", "child.register", "child.link_by_code", "child.link_request.approve", "child.unlink",
+    "child.teacher_link", "child.teacher_unlink", "child.safety_term.add", "child.safety_term.remove",
+    "device.register", "device.pair", "device.link_token.create", "device.rename", "device.delete", "platform.device.revoke", "school.upsert", "school.update", "class.upsert",
+    "school_invitation.claim", "school_invitation.create", "school_invitation.resend", "school_request.approve", "school_request.reject",
+    "notification.create", "notification.broadcast",
+  ]);
+  const ownRecentActions = auditRows.filter(row => row.actorId === user.id && auditActions.has(row.action)).slice(0, 20);
+  const childRecentActions = auditRows.filter(row => row.actorId !== user.id && row.entityType === "child" && row.entityId && dataChildIds.includes(row.entityId) && auditActions.has(row.action)).slice(0, 15);
+  const schoolProfile = user.schoolId ? await prisma.school.findUnique({ where: { id: user.schoolId }, select: { name: true, isActive: true } }) : null;
+  const notificationPreference = wantsSettings ? await prisma.notificationPreference.findUnique({ where: { userId: user.id }, select: { pushEnabled: true } }) : null;
+  const aiSettingsForContext = wantsSettings ? await prisma.aIGuardianSettings.findUnique({ where: { userId: user.id }, select: { enabled: true, saveConversations: true, voiceEnabled: true, language: true } }) : null;
+  const profilePreferences = wantsSettings ? objectData(user.preferences) : {};
+  const guardianVoicePreferences = objectData((profilePreferences.guardianVoice ?? {}) as Prisma.JsonValue);
+  const subscriptionRows = wantsSubscription ? await prisma.legacyRecord.findMany({ where: { collection: "subscriptions" }, orderBy: { updatedAt: "desc" }, take: 100, select: { data: true, updatedAt: true } }) : [];
+  const subscriptions = subscriptionRows.flatMap(row => {
+    const data = objectData(row.data);
+    if (!legacyOwner(data, user.id) && !legacyOwner(data, user.firebaseUid)) return [];
+    const summary: Record<string, unknown> = { updatedAt: row.updatedAt.toISOString() };
+    for (const key of ["plan", "status", "isActive", "startDate", "endDate", "expiryDate", "platform"]) {
+      const value = data[key];
+      if (typeof value === "string") summary[key] = cleanContextText(value, 80);
+      else if (typeof value === "boolean") summary[key] = value;
+    }
+    return [summary];
+  }).slice(0, 10);
+  const schoolInvitations = (wantsSchool || wantsLinking || wantsAudit) && user.role === Role.ADMIN && user.schoolId
+    ? await prisma.schoolInvitation.findMany({ where: { schoolId: user.schoolId }, orderBy: { createdAt: "desc" }, take: 20, select: { fullName: true, role: true, expiresAt: true, usedAt: true, createdAt: true } })
+    : [];
   const contextRecords: Array<Record<string, unknown>> = [];
   for (const collection of requestedCollections) {
     if (contextRecords.length >= 60) break;
@@ -816,11 +904,87 @@ app.post("/api/ai/chat", authenticate, asyncRoute(async (req, res) => {
     }
   }
   const context = {
-    role: user.role === Role.ADMIN ? "school administrator" : user.role.toLowerCase(),
+    generatedAt: new Date().toISOString(),
+    timeZone: "Africa/Nairobi",
+    identity: {
+      name: cleanContextText(user.fullName, 100),
+      role: user.role === Role.ADMIN ? (user.schoolId ? "school administrator" : "platform administrator") : user.role.toLowerCase(),
+      ...(wantsProfile ? { email: user.email } : {}),
+      ...(wantsProfile && user.phone ? { phone: cleanContextText(user.phone, 40) } : {}),
+      emailVerified: user.emailVerified,
+      accountStatus: user.isActive ? "active" : "inactive",
+      preferredLanguage: settings.language,
+      ...(wantsSubscription ? { premium: user.isPremium, premiumExpiry: user.premiumExpiry?.toISOString() ?? null } : {}),
+      school: schoolProfile ? { name: cleanContextText(schoolProfile.name, 100), active: schoolProfile.isActive } : null,
+    },
+    featureCatalogue: intent.features ? kidGuardFeatureCatalogue(user.role, "android") : undefined,
+    childSelection: childSelection.needsClarification ? {
+      clarificationRequired: true,
+      message: settings.language === "en" ? "Ask which child the user means before sharing individual activity." : "Uliza ni mtoto gani anamaanisha kabla ya kueleza taarifa za mtoto mmoja.",
+      availableNames: childSelection.choices,
+    } : undefined,
+    accountSettings: wantsSettings ? {
+      aiEnabled: aiSettingsForContext?.enabled ?? false,
+      saveAiConversations: aiSettingsForContext?.saveConversations ?? false,
+      voiceEnabled: aiSettingsForContext?.voiceEnabled ?? false,
+      aiLanguage: aiSettingsForContext?.language ?? settings.language,
+      pushNotificationsEnabled: notificationPreference?.pushEnabled ?? true,
+      ...(profilePreferences.language === "sw" || profilePreferences.language === "en" ? { appLanguage: profilePreferences.language } : {}),
+      ...(profilePreferences.theme === "light" || profilePreferences.theme === "dark" || profilePreferences.theme === "system" ? { theme: profilePreferences.theme } : {}),
+      guardianVoice: {
+        gender: guardianVoicePreferences.gender === "male" ? "male" : guardianVoicePreferences.gender === "female" ? "female" : null,
+        language: ["auto", "sw", "en"].includes(String(guardianVoicePreferences.language)) ? guardianVoicePreferences.language : null,
+        rate: typeof guardianVoicePreferences.rate === "number" ? Math.max(0.75, Math.min(1.25, guardianVoicePreferences.rate)) : null,
+      },
+    } : undefined,
+    subscriptions,
+    schoolInvitations: schoolInvitations.map(invitation => ({
+      invitee: cleanContextText(invitation.fullName, 80), role: invitation.role,
+      status: invitation.usedAt ? "claimed" : invitation.expiresAt <= new Date() ? "expired" : "pending",
+      createdAt: invitation.createdAt.toISOString(), expiresAt: invitation.expiresAt.toISOString(),
+      claimedAt: invitation.usedAt?.toISOString() ?? null,
+    })),
+    activityCoverage: {
+      deviceEvents: "Only events received from a paired device during connectivity and enabled permissions are available.",
+      accountAudit: "Only selected changes recorded by KidGuard audit logging are available; this is not a log of every tap or action.",
+      screenTime: "Device-reported screen-time records are queried for the most recent seven days.",
+      notifications: "Stored notifications for this signed-in recipient are queried from the most recent thirty days.",
+    },
+    recentAccountActions: [...ownRecentActions, ...childRecentActions].map(row => ({
+      action: row.action,
+      entity: row.entityType,
+      occurredAt: row.createdAt.toISOString(),
+      actor: row.actorId === user.id ? "current user" : "another authorized account",
+    })).slice(0, 25),
     schools: schools.map(school => ({ name: cleanContextText(school.name, 100), motto: cleanContextText(school.motto, 120) })),
     childCount: user.role === Role.ADMIN && (wantsAttendance || summaryIntent) ? await prisma.child.count({ where: { schoolId: user.schoolId!, isActive: true } }) : children.length,
-    children: (wantsLocation || wantsScreenTime || wantsDevices || requestedCollections.length > 0 ? children : []).slice(0, 30).map((child: { id: string }, index: number) => ({
+    children: children.slice(0, 30).map((child: { id: string; fullName: string; schoolId: string | null; schoolName?: string | null; className?: string | null }, index: number) => {
+      const selectedForQuestion = dataChildIds.includes(child.id);
+      return {
       label: childLabels.get(child.id) ?? `Mtoto ${index + 1}`,
+      fullName: cleanContextText(child.fullName, 100),
+      relationship: user.role === Role.PARENT ? "parent/guardian" : user.role === Role.TEACHER ? "assigned teacher" : "school administrator scope",
+      selectedForQuestion,
+      ...(selectedForQuestion ? {
+      className: cleanContextText(child.className, 80),
+      school: cleanContextText(child.schoolName, 100),
+      linkedDevices: devices.filter(device => device.childId === child.id).slice(0, 5).map(device => ({
+        name: cleanContextText(device.name, 80), platform: device.platform,
+        status: device.lastSeen && device.lastSeen.getTime() >= Date.now() - 35 * 60_000 ? "ONLINE" : "OFFLINE",
+        lastSeen: device.lastSeen?.toISOString() ?? null,
+        monitoringAuthorized: device.isAuthorized,
+        heartbeat: (() => {
+          const latest = deviceHeartbeats.find(item => item.deviceId === device.id);
+          if (!latest) return null;
+          const state = objectData(latest.payload);
+          return {
+            observedAt: latest.createdAt.toISOString(),
+            monitoringActive: state.monitoringActive === true,
+            accessibilityActive: state.accessibilityActive === true,
+            usageAccessActive: state.usageAccessActive === true,
+          };
+        })(),
+      })),
       lastLocation: locations.find(location => location.childId === child.id)
         ? (() => { const point = locations.find(location => location.childId === child.id)!; return { place: cleanContextText(point.placeName), observedAt: point.timestamp.toISOString() }; })()
         : null,
@@ -837,7 +1001,8 @@ app.post("/api/ai/chat", authenticate, asyncRoute(async (req, res) => {
         return { date: new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Nairobi", year: "numeric", month: "2-digit", day: "2-digit" }).format(item.date), minutes: item.totalMinutes, unlocks: item.unlockedCount, apps };
       }),
       deviceStatus: (() => { const device = devices.find(item => item.childId === child.id); return device ? { status: device.lastSeen && device.lastSeen.getTime() >= Date.now() - 35 * 60_000 ? "ONLINE" : "OFFLINE", lastSeen: device.lastSeen?.toISOString() ?? null } : null; })(),
-    })),
+      } : {}),
+    }; }),
     recentNotifications: recentNotifications.map(item => {
       const payload = objectData(item.payload);
       const label = item.childId ? childLabels.get(item.childId) : undefined;
@@ -851,6 +1016,9 @@ app.post("/api/ai/chat", authenticate, asyncRoute(async (req, res) => {
         riskSeverity: cleanContextText(payload.riskSeverity, 20),
         generatedReason: cleanContextText(payload.explanation, 240),
         createdAt: item.createdAt.toISOString(),
+        read: item.isRead,
+        deliveryStatus: item.deliveryStatus,
+        deliveredAt: item.deliveredAt?.toISOString() ?? null,
       };
     }),
     recentActivity: recentActivity.map(event => {
@@ -1636,6 +1804,7 @@ app.post("/api/device-links", authenticate, allow(Role.ADMIN, Role.TEACHER, Role
   const token = randomBytes(32).toString("base64url");
   const expiresAt = new Date(Date.now() + input.data.validForMinutes * 60_000);
   await prisma.deviceLinkToken.create({ data: { tokenHash: createHash("sha256").update(token).digest("hex"), childId: input.data.childId, actorId: user.id, expiresAt } });
+  await prisma.auditLog.create({ data: { actorId: user.id, action: "device.link_token.create", entityType: "child", entityId: input.data.childId, details: { validForMinutes: input.data.validForMinutes } } });
   res.status(201).json({ token, expiresAt: expiresAt.toISOString() });
 }));
 
@@ -1714,6 +1883,7 @@ app.post("/api/device-links/register", authenticate, allow(Role.ADMIN, Role.TEAC
     const result = await transaction.device.create({ data: { deviceKey: value.deviceKey, childId: link.childId, schoolId: child.schoolId, ownerId: link.actorId, platform: value.platform, name: value.name, model: value.model, osVersion: value.osVersion, deviceSecretHash: createHash("sha256").update(value.deviceSecret).digest("hex"), status: "ONLINE", isAuthorized: true, lastSeen: new Date() } });
     await transaction.deviceRegistration.create({ data: { deviceId: result.id, actorId: link.actorId, authorized: true } });
     await transaction.deviceLinkToken.update({ where: { tokenHash }, data: { deviceId: result.id } });
+    await transaction.auditLog.create({ data: { actorId: actor.id, action: "device.pair", entityType: "device", entityId: result.id, details: { childId: link.childId, platform: value.platform } } });
     return { device: result, childId: link.childId, ownerId: actor.id };
   });
   if (!device) { res.status(410).json({ error: "Pairing token is invalid, expired, or already used" }); return; }
@@ -1858,6 +2028,7 @@ app.patch("/api/notifications/preferences", authenticate, asyncRoute(async (req,
   const input = z.object({ pushEnabled: z.boolean().optional(), types: z.record(z.boolean()).optional() }).refine(value => value.pushEnabled !== undefined || value.types !== undefined).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
   const preference = await prisma.notificationPreference.upsert({ where: { userId: req.principal!.id }, create: { userId: req.principal!.id, pushEnabled: input.data.pushEnabled, types: input.data.types }, update: input.data });
+  await prisma.auditLog.create({ data: { actorId: req.principal!.id, action: "notification.preferences.update", entityType: "notification_preferences", entityId: req.principal!.id, details: { changedFields: Object.keys(input.data) } } });
   res.json({ preferences: preference });
 }));
 
@@ -2274,6 +2445,7 @@ async function createDailyUsageSummaries() {
 const port = Number(process.env.PORT) || 8080;
 const server = app.listen(port, () => console.log(`KidGuard API listening on ${port}`));
 const dailySummaryTimer = setInterval(() => { void createDailyUsageSummaries().catch(error => console.error("Daily usage summary job failed", error)); }, 15 * 60 * 1000);
+const heartbeatAlertTimer = setInterval(() => { void alertForStaleChildDevices().catch(() => console.error("Monitoring heartbeat alert job failed")); }, 5 * 60 * 1000);
 const monitoringRetentionTimer = setInterval(() => { void pruneExpiredMonitoringData().catch(() => console.error("Monitoring retention job failed")); }, 24 * 60 * 60 * 1000);
 const locationRetentionTimer = setInterval(() => { void pruneExpiredLocations().catch(() => console.error("Location retention job failed")); }, 24 * 60 * 60 * 1000);
 async function pruneExpiredMonitoringData() {
@@ -2290,7 +2462,52 @@ async function pruneExpiredMonitoringData() {
 void pruneExpiredMonitoringData().catch(() => console.error("Monitoring retention job failed"));
 void pruneExpiredLocations().catch(() => console.error("Location retention job failed"));
 void createDailyUsageSummaries().catch(error => console.error("Daily usage summary job failed", error));
-for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => server.close(() => { clearInterval(dailySummaryTimer); clearInterval(monitoringRetentionTimer); clearInterval(locationRetentionTimer); void prisma.$disconnect().finally(() => process.exit(0)); }));
+void alertForStaleChildDevices().catch(() => console.error("Monitoring heartbeat alert job failed"));
+for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => server.close(() => { clearInterval(dailySummaryTimer); clearInterval(heartbeatAlertTimer); clearInterval(monitoringRetentionTimer); clearInterval(locationRetentionTimer); void prisma.$disconnect().finally(() => process.exit(0)); }));
+
+async function alertForStaleChildDevices() {
+  const devices = await prisma.device.findMany({
+    where: { childId: { not: null }, ownerId: { not: null }, isAuthorized: true },
+    select: { id: true, childId: true, ownerId: true, name: true, createdAt: true },
+    take: 1000,
+  });
+  if (!devices.length) return;
+  const ids = devices.map(device => device.id);
+  const heartbeats = await prisma.deviceActivityEvent.findMany({
+    where: { deviceId: { in: ids }, type: "device_heartbeat" },
+    orderBy: { createdAt: "desc" }, distinct: ["deviceId"],
+    select: { deviceId: true, createdAt: true },
+  });
+  const latest = new Map(heartbeats.map(row => [row.deviceId, row.createdAt]));
+  const [alerts, settings] = await Promise.all([
+    prisma.notification.findMany({ where: { relatedEntity: "monitoring_heartbeat", relatedId: { in: ids } }, orderBy: { createdAt: "desc" }, take: ids.length * 2, select: { relatedId: true, createdAt: true } }),
+    prisma.aIGuardianSettings.findMany({ where: { userId: { in: [...new Set(devices.flatMap(device => device.ownerId ? [device.ownerId] : []))] } }, select: { userId: true, language: true } }),
+  ]);
+  const lastAlerts = new Map<string, Date>();
+  for (const alert of alerts) if (alert.relatedId && !lastAlerts.has(alert.relatedId)) lastAlerts.set(alert.relatedId, alert.createdAt);
+  const languages = new Map(settings.map(setting => [setting.userId, setting.language]));
+  const cutoffMs = 35 * 60_000;
+  const now = Date.now();
+  for (const device of devices) {
+    if (!device.ownerId || !device.childId) continue;
+    const lastHeartbeat = latest.get(device.id) ?? null;
+    const baseline = lastHeartbeat ?? device.createdAt;
+    if (now - baseline.getTime() < cutoffMs) continue;
+    if ((lastAlerts.get(device.id)?.getTime() ?? 0) > baseline.getTime()) continue;
+    const english = languages.get(device.ownerId) === "en";
+    const title = english ? "Child device stopped checking in" : "Kifaa cha mtoto hakijaripoti";
+    const body = english
+      ? `${device.name} has not sent a monitoring heartbeat for over 35 minutes. The device may be offline, the service may have stopped, or permissions may have changed. Open KidGuard to review its status.`
+      : `${device.name} haijatuma heartbeat ya ulinzi kwa zaidi ya dakika 35. Huenda kifaa hakina mtandao, huduma ilisimama, au ruhusa zimebadilika. Fungua KidGuard kuangalia hali.`;
+    const notification = await prisma.notification.create({ data: {
+      recipientId: device.ownerId, childId: device.childId, title, body, type: "behavior",
+      relatedEntity: "monitoring_heartbeat", relatedId: device.id,
+      payload: { source: "monitoring_heartbeat", deviceId: device.id, childId: device.childId },
+      ...classifyNotificationVoice("behavior"),
+    } });
+    await deliver(notification.id, device.ownerId, title, body, notification.payload as Record<string, unknown>);
+  }
+}
 
 async function pruneExpiredLocations() {
   await prisma.deviceLocation.deleteMany({ where: { retentionClass: "child_gps_v1", timestamp: { lt: new Date(Date.now() - 30 * 86_400_000) } } });

@@ -108,11 +108,23 @@ export function cleanContextText(value: unknown, max = 120): string | undefined 
 export function classifyAiQuestionIntent(messages: ChatMessage[]) {
   const question = messages.filter(message => message.role === "user").slice(-6).map(message => message.content).join(" ").normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
   const summary = /\b(summary|muhtasari|overview|ripoti ya jumla)\b/.test(question);
+  const features = /\b(feature|features|how do i|how can i|what can kidguard|what does kidguard|vipengele|nawezaje|natumiaje)\b/.test(question);
+  const profile = /\b(my account|my profile|my name|my role|account status|akaunti yangu|wasifu wangu|jina langu|hali ya akaunti)\b/.test(question);
+  const settings = /\b(settings|preferences|mipangilio|mapendeleo|language|theme|voice preferences|app language|lugha ya programu|lugha ya app|muonekano|sauti ninayotumia)\b/.test(question);
+  const subscription = /\b(subscription|premium|plan|billing|usajili|malipo|mpango)\b/.test(question);
+  const linking = /\b(link|linked|pair|pairing|register|registration|qr code|unlink|unganisha|kuunganisha|usajili wa kifaa)\b/.test(question);
+  const audit = /\b(when did|history|account activity|lini|historia ya akaunti|shughuli za akaunti)\b/.test(question);
   const screenTime = summary || /\b(screen.?time|usage|matumizi ya simu|muda wa simu|muda wa kutumia simu|ametumia simu|apps?|application|programu)\b/.test(question);
   const notifications = /\b(notification|notifications|arifa|alert|alerts|tahadhari|muhimu|important|attention|concern|should know|need to know|pay attention|nifuatilie|niangalie|nifahamu|kuna jambo|kuna nini|generated|generated reason|kwa nini|sababu ya|imetokeaje)\b/.test(question);
   const activity = summary || /\b(activity|activities|recent|recently|hivi karibuni|shughuli|matukio|kilichotokea|kimetokea|yaliyotokea|kilichofanyika|what happened|anything happened|events?|muhimu|important|attention|should know|need to know|pay attention|kuna jambo|nifuatilie|nifahamu)\b/.test(question);
   return {
     summary,
+    features,
+    profile,
+    settings,
+    subscription,
+    linking,
+    audit,
     screenTime,
     notifications,
     activity,
@@ -122,8 +134,62 @@ export function classifyAiQuestionIntent(messages: ChatMessage[]) {
     behavior: summary || /\b(behavior|tabia|bully|bullying|vitisho|safety|usalama|hatari)\b/.test(question),
     results: summary || /\b(results?|matokeo|marks|score|grade|alama)\b/.test(question),
     school: summary || /\b(school|shule|announcement|tangazo|taarifa za shule)\b/.test(question),
-    devices: summary || /\b(device|kifaa|connected|imeunganishwa|online|offline|monitoring|ufuatiliaji)\b/.test(question),
+    devices: summary || /\b(device|kifaa|connected|imeunganishwa|online|offline|monitoring|ufuatiliaji|permission|permissions|accessibility|usage access|background|izin|ufikiaji)\b/.test(question),
   };
+}
+
+/** Static descriptions of shipped features only; no roadmap claims. */
+export function kidGuardFeatureCatalogue(role: string, platform = "android") {
+  const common = [
+    { feature: "AI Guardian", purpose: "Ask about authorized child and school data; availability depends on account settings and server configuration.", location: "Home → KidGuard AI" },
+    { feature: "Notifications", purpose: "View alerts delivered to this account.", location: "Home → Notifications" },
+    { feature: "Profile and settings", purpose: "Edit allowed personal fields and manage language, theme and notification preferences.", location: "Profile / Settings" },
+  ];
+  const byRole: Record<string, Array<{ feature: string; purpose: string; location: string }>> = {
+    PARENT: [
+      { feature: "Child profiles and links", purpose: "Register or link children and view their linked records.", location: "Home → Children" },
+      { feature: "Child device monitoring", purpose: "Pair Android devices and view reported usage, screen time, protection state and latest heartbeat.", location: "Home → Monitoring" },
+      { feature: "Safety terms", purpose: "Manage parent terms used by the paired Android local content matcher.", location: "Child monitoring → Safety terms" },
+      { feature: "School records", purpose: "View available attendance, homework, published results and announcements for linked children.", location: "Home → School" },
+      { feature: "Child location", purpose: "View a location only when sharing is enabled and the device has reported one.", location: "Home → Location" },
+      { feature: "Subscription", purpose: "View the account subscription screen and recorded plan state.", location: "Profile → Subscription" },
+    ],
+    TEACHER: [
+      { feature: "Assigned students", purpose: "View linked students and permitted school records.", location: "Home → Students" },
+      { feature: "Class records", purpose: "Use available attendance, homework, behavior, results and announcement screens within assignment scope.", location: "Home → School" },
+    ],
+    ADMIN: [
+      { feature: "School and class management", purpose: "Manage the assigned school, classes and authorized students.", location: "Home → School administration" },
+      { feature: "Teacher invitations", purpose: "Invite teachers to the assigned school and view invitation status.", location: "Home → Teachers" },
+      { feature: "School monitoring", purpose: "Review device and activity information within assigned school scope.", location: "Home → Monitoring" },
+    ],
+  };
+  return { platform, accountRole: role, features: [...common, ...(byRole[role] ?? [])] };
+}
+
+export function resolveAiChildSelection(messages: ChatMessage[], children: Array<{ id: string; fullName: string }>) {
+  const question = messages.filter(message => message.role === "user").slice(-6).map(message => message.content).join(" ")
+    .normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
+  const normalized = (value: string) => value.normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  const query = ` ${normalized(question)} `;
+  const named = children.filter(child => {
+    const name = normalized(child.fullName);
+    return name.length >= 2 && query.includes(` ${name} `);
+  });
+  if (named.length === 1) return { childIds: [named[0].id], needsClarification: false, choices: [] as string[] };
+  if (named.length > 1) return { childIds: named.map(child => child.id), needsClarification: false, choices: [] as string[] };
+  const firstNameMatches = children.filter(child => {
+    const firstName = normalized(child.fullName).split(" ")[0];
+    return firstName.length >= 2 && query.includes(` ${firstName} `);
+  });
+  if (firstNameMatches.length === 1) return { childIds: [firstNameMatches[0].id], needsClarification: false, choices: [] as string[] };
+  if (firstNameMatches.length > 1) return { childIds: [], needsClarification: true, choices: firstNameMatches.slice(0, 10).map(child => cleanContextText(child.fullName, 80) ?? "Mtoto") };
+  const allChildren = /\b(all (my )?(children|kids)|both (my )?(children|kids)|my children|my kids|children|kids|watoto|children wangu|watoto wangu( wote)?|kila mtoto|each child|every child)\b/.test(question);
+  if (allChildren || children.length <= 1) return { childIds: children.map(child => child.id), needsClarification: false, choices: [] as string[] };
+  const singularChild = /\b(my child|my son|my daughter|child wangu|mtoto wangu|huyo mtoto|yule mtoto|mtoto huyu|mtoto wake|child|son|daughter|mtoto|mwanafunzi|student)\b/.test(question);
+  const individualDataQuestion = /\b(screen.?time|usage|apps?|application|activity|activities|device|phone|tablet|location|where|muda wa simu|matumizi|programu|shughuli|kifaa|simu|mahali|wapi)\b/.test(question);
+  if (singularChild || individualDataQuestion) return { childIds: [] as string[], needsClarification: true, choices: children.slice(0, 10).map(child => cleanContextText(child.fullName, 80) ?? "Mtoto") };
+  return { childIds: children.map(child => child.id), needsClarification: false, choices: [] as string[] };
 }
 
 export const AI_MAX_CONTEXT_CHARS = 12_000;

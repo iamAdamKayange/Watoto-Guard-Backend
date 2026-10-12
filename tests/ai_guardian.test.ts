@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AI_MAX_CONTEXT_CHARS, boundAiContext, buildConversationWindow, canUseAiGuardian, classifyAiQuestionIntent, classifyNotificationVoice, classifySafetyVoice, cleanContextText, AiAssistantRequestError, ownedConversationWhere, requestAiAssistant, resolveAiAssistantConfiguration, validateChatMessages } from "../src/ai_guardian";
+import { AI_MAX_CONTEXT_CHARS, boundAiContext, buildConversationWindow, canUseAiGuardian, classifyAiQuestionIntent, classifyNotificationVoice, classifySafetyVoice, cleanContextText, AiAssistantRequestError, kidGuardFeatureCatalogue, ownedConversationWhere, requestAiAssistant, resolveAiAssistantConfiguration, resolveAiChildSelection, validateChatMessages } from "../src/ai_guardian";
 
 test("AI assistant configuration normalizes host and surrounding whitespace without exposing secrets", () => {
   assert.deepEqual(resolveAiAssistantConfiguration(" https://kidguard-ai-assistant.onrender.com/ ", ` ${"s".repeat(40)} `), {
@@ -81,6 +81,43 @@ test("Swahili and English questions select scoped screen time, activity, alerts 
   ]);
   assert.equal(followUp.activity, true);
   assert.equal(followUp.screenTime, true);
+});
+
+test("AI intent recognizes profile, settings, subscription, pairing, audit and app help in both languages", () => {
+  for (const question of ["How do I link my child's device?", "Naangaliaje usajili wa kifaa?", "Where are my settings?", "Nataka kujua historia ya akaunti yangu", "What is my subscription plan?", "Ni vipengele gani vinapatikana?"]) {
+    const intent = classifyAiQuestionIntent([{ role: "user", content: question }]);
+    assert.ok(intent.linking || intent.settings || intent.audit || intent.subscription || intent.features);
+  }
+  assert.equal(classifyAiQuestionIntent([{ role: "user", content: "My account profile and status" }]).profile, true);
+});
+
+test("multiple-child references select a named child or request clarification without selecting any child's records", () => {
+  const children = [{ id: "c1", fullName: "Asha Kayange" }, { id: "c2", fullName: "Baraka Kayange" }];
+  assert.deepEqual(resolveAiChildSelection([{ role: "user", content: "How much screen time did my child have?" }], children), {
+    childIds: [], needsClarification: true, choices: ["Asha Kayange", "Baraka Kayange"],
+  });
+  assert.deepEqual(resolveAiChildSelection([{ role: "user", content: "Screen time for Asha Kayange" }], children), {
+    childIds: ["c1"], needsClarification: false, choices: [],
+  });
+  assert.deepEqual(resolveAiChildSelection([{ role: "user", content: "Screen time for Asha" }], children).childIds, ["c1"]);
+  assert.deepEqual(resolveAiChildSelection([{ role: "user", content: "Show both my children" }], children).childIds, ["c1", "c2"]);
+  assert.deepEqual(resolveAiChildSelection([{ role: "user", content: "How much screen time?" }], children).childIds, []);
+  assert.equal(resolveAiChildSelection([{ role: "user", content: "How much screen time?" }], children).needsClarification, true);
+  assert.deepEqual(resolveAiChildSelection([{ role: "user", content: "Show screen time for my kids" }], children).childIds, ["c1", "c2"]);
+  assert.deepEqual(resolveAiChildSelection([{ role: "user", content: "Show children's screen time" }], children).childIds, ["c1", "c2"]);
+  const duplicateFirstNames = [{ id: "c1", fullName: "Asha Juma" }, { id: "c2", fullName: "Asha Kayange" }];
+  assert.equal(resolveAiChildSelection([{ role: "user", content: "Screen time for Asha" }], duplicateFirstNames).needsClarification, true);
+  assert.deepEqual(resolveAiChildSelection([{ role: "user", content: "Screen time for Asha Juma" }], duplicateFirstNames).childIds, ["c1"]);
+  assert.deepEqual(resolveAiChildSelection([{ role: "user", content: "Muda wa simu wa mtoto wangu" }], children).childIds, []);
+});
+
+test("feature catalogue is role-specific and limits descriptions to shipped surfaces", () => {
+  const parent = kidGuardFeatureCatalogue("PARENT");
+  assert.ok(parent.features.some(feature => feature.feature === "Child device monitoring"));
+  assert.ok(!parent.features.some(feature => feature.feature === "Device Owner Mode"));
+  assert.ok(kidGuardFeatureCatalogue("TEACHER").features.some(feature => feature.feature === "Assigned students"));
+  assert.ok(kidGuardFeatureCatalogue("ADMIN").features.some(feature => feature.feature === "Teacher invitations"));
+  assert.equal(kidGuardFeatureCatalogue("UNKNOWN").features.length, 3);
 });
 
 test("context sent to Python stays within its limit while retaining authorized child records", () => {
