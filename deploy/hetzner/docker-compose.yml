@@ -49,7 +49,8 @@ services:
       NODE_ENV: production
       PORT: "8080"
       DATABASE_URL: postgresql://${POSTGRES_USER:-kidguard}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-kidguard}?connection_limit=15&pool_timeout=20
-      AI_ASSISTANT_HOST: http://ai:8000
+      # Hosted AI by default on small servers (set in .env); http://ai:8000 with --profile ai.
+      AI_ASSISTANT_HOST: ${AI_ASSISTANT_HOST:-http://ai:8000}
     networks: [internal, edge]
     deploy:
       resources:
