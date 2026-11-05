@@ -34,7 +34,9 @@ export function resolveAiAssistantConfiguration(
   } catch {
     return { ok: false, code: "ai_host_invalid" };
   }
-  const isLocalHost = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(url.hostname);
+  // Plain HTTP is accepted only for loopback and single-label private service names
+  // (e.g. the Docker Compose service "ai"), which never resolve on the public internet.
+  const isLocalHost = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(url.hostname) || /^[a-z][a-z0-9-]{0,62}$/i.test(url.hostname);
   if (!(["https:", "http:"].includes(url.protocol)) ||
       (url.protocol === "http:" && !isLocalHost) ||
       !!url.username || !!url.password || !!url.search || !!url.hash ||

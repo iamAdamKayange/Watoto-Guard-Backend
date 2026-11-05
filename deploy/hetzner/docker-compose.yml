@@ -1,0 +1,103 @@
+# KidGuard production stack for a single Hetzner Cloud server.
+#   caddy  -> automatic HTTPS (Let's Encrypt), gzip/zstd, security headers
+#   api    -> Node/Express API (private network only)
+#   ai     -> Python AI/voice assistant (private network only)
+#   db     -> PostgreSQL 16 (private network only, data on a named volume)
+#
+# Usage (from this folder on the server):
+#   cp .env.production.example .env && nano .env
+#   docker compose up -d --build
+name: kidguard
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-kidguard}
+      POSTGRES_USER: ${POSTGRES_USER:-kidguard}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - max_connections=60
+      - -c
+      - log_min_duration_statement=500
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [internal]
+
+  api:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      PORT: "8080"
+      DATABASE_URL: postgresql://${POSTGRES_USER:-kidguard}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-kidguard}?connection_limit=15&pool_timeout=20
+      AI_ASSISTANT_HOST: http://ai:8000
+    networks: [internal, edge]
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+
+  ai:
+    build:
+      context: ../../ai-assistant
+    restart: unless-stopped
+    profiles: ["ai"]
+    environment:
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash-lite}
+      AI_ASSISTANT_SHARED_SECRET: ${AI_ASSISTANT_SHARED_SECRET:-}
+      WHISPER_MODEL: ${WHISPER_MODEL:-tiny}
+      WHISPER_COMPUTE_TYPE: int8
+      WHISPER_CPU_THREADS: ${WHISPER_CPU_THREADS:-2}
+    # "edge" gives outbound internet (Gemini API); no ports are published for this service.
+    networks: [internal, edge]
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on: [api]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      API_DOMAIN: ${API_DOMAIN:?set API_DOMAIN in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [edge]
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
+
+networks:
+  internal:
+    internal: true
+  edge:

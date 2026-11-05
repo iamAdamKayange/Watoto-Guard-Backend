@@ -4,3 +4,5 @@ dist/
 ai-assistant/.venv/
 ai-assistant/__pycache__/
 ai-assistant/*.py[cod]
+
+deploy/hetzner/.env

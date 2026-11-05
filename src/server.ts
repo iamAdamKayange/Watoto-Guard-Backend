@@ -6,23 +6,34 @@ import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { Prisma, PrismaClient, Role, SchoolRequestStatus } from "@prisma/client";
 import { OAuth2Client } from "google-auth-library";
 import { z } from "zod";
-import { createHash, createHmac, randomBytes, randomInt, scryptSync, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
 import { sendSendlibEmail, sendSendlibOtpEmail } from "./sendlib";
-import { GuardianVoiceError, guardianVoiceInputSchema, synthesizeGuardianVoice } from "./guardian_voice";
+import { TtlCache, burnPasswordCheck, clientIp, hashPasswordAsync, limiter, rateLimit, runWithConcurrency, tooMany, verifyPasswordAsync } from "./security";
+import { GuardianVoiceError, guardianTranscriptionSchema, guardianVoiceAuthorizationAllowed, guardianVoiceInputSchema, synthesizeGuardianVoice, transcribeGuardianVoice } from "./guardian_voice";
 import { AI_MAX_REQUESTS_PER_MINUTE, boundAiContext, buildConversationWindow, canUseAiGuardian, classifyAiQuestionIntent, classifyNotificationVoice, classifySafetyVoice, cleanContextText, AiAssistantRequestError, kidGuardFeatureCatalogue, ownedConversationWhere, requestAiAssistant, resolveAiAssistantConfiguration, resolveAiChildSelection, validateChatMessages } from "./ai_guardian";
 
 const prisma = new PrismaClient();
 const app = express();
 app.disable("x-powered-by");
+// Behind Caddy/nginx on Hetzner the real client IP arrives in X-Forwarded-For.
+// Only proxies on loopback/private networks are trusted so clients cannot spoof their IP.
+app.set("trust proxy", process.env.TRUST_PROXY ?? "loopback, linklocal, uniquelocal");
 app.use(helmet());
 const configuredCorsOrigins = (process.env.CORS_ORIGINS ?? "").split(",").map(origin => origin.trim()).filter(Boolean);
 const corsOrigins = [...new Set([...configuredCorsOrigins, "https://kidguard-admin-site.vercel.app"])];
-app.use(cors({ origin: process.env.CORS_ORIGINS === undefined ? true : corsOrigins }));
+app.use(cors({ origin: process.env.CORS_ORIGINS === undefined ? true : corsOrigins, maxAge: 600 }));
 app.use(express.json({ limit: "256kb" }));
+// Global per-IP ceiling; individual sensitive routes have tighter limits below.
+app.use("/api", rateLimit("global", Number(process.env.API_RATE_LIMIT_PER_MINUTE) || 600, 60_000));
+// API responses contain personal data about children; never let proxies or browsers cache them.
+app.use("/api", (_req, res, next) => { res.setHeader("Cache-Control", "no-store"); next(); });
 
-const firebaseServiceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
-  ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON) as { project_id?: string; client_email?: string; private_key?: string }
-  : undefined;
+function parseServiceAccount(raw: string | undefined) {
+  if (!raw) return undefined;
+  try { return JSON.parse(raw) as { project_id?: string; client_email?: string; private_key?: string }; }
+  catch { console.error("FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON; push delivery is disabled"); return undefined; }
+}
+const firebaseServiceAccount = parseServiceAccount(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
 const firebaseProjectId = process.env.FIREBASE_PROJECT_ID || firebaseServiceAccount?.project_id;
 const firebaseClientEmail = process.env.FIREBASE_CLIENT_EMAIL || firebaseServiceAccount?.client_email;
 const firebasePrivateKey = process.env.FIREBASE_PRIVATE_KEY || firebaseServiceAccount?.private_key;
@@ -33,23 +44,43 @@ const authTokenSecret = process.env.AUTH_TOKEN_SECRET;
 const googleClientIds = (process.env.GOOGLE_CLIENT_IDS ?? "").split(",").map(value => value.trim()).filter(Boolean);
 
 if (!getApps().length && firebaseProjectId && firebaseClientEmail && firebasePrivateKey) {
-  initializeApp({ credential: cert({
-    projectId: firebaseProjectId,
-    clientEmail: firebaseClientEmail,
-    privateKey: firebasePrivateKey.replace(/\\n/g, "\n"),
-  }) });
+  try {
+    initializeApp({ credential: cert({
+      projectId: firebaseProjectId,
+      clientEmail: firebaseClientEmail,
+      privateKey: firebasePrivateKey.replace(/\\n/g, "\n"),
+    }) });
+  } catch { console.error("Firebase Admin credentials are invalid; push delivery is disabled"); }
 }
+if (!authTokenSecret || Buffer.byteLength(authTokenSecret) < 32) console.error("AUTH_TOKEN_SECRET is missing or shorter than 32 bytes; authenticated routes will return 503");
 
 type Principal = { id: string; firebaseUid: string; role: Role; schoolId: string | null; fullName: string; email: string; phone: string | null; emailVerified: boolean; isActive: boolean; isPremium: boolean; premiumExpiry: Date | null; preferences: Prisma.JsonValue };
 declare global { namespace Express { interface Request { principal?: Principal } } }
 
-function publicUser<T extends { id: string; firebaseUid: string; passwordHash?: string | null }>(row: T) {
-  const { id, firebaseUid: _firebaseUid, passwordHash: _passwordHash, ...data } = row;
+function publicUser<T extends { id: string; firebaseUid: string; passwordHash?: string | null; tokenVersion?: number }>(row: T) {
+  const { id, firebaseUid: _firebaseUid, passwordHash: _passwordHash, tokenVersion: _tokenVersion, ...data } = row;
   return { ...data, id: row.firebaseUid, databaseId: id };
 }
 
 function asyncRoute(handler: (req: Request, res: Response) => Promise<unknown>) {
   return (req: Request, res: Response, next: NextFunction) => { void handler(req, res).catch(next); };
+}
+
+type CachedPrincipal = Principal & { tokenVersion: number; schoolActive: boolean };
+// Bursts of requests from one app screen re-use the same lookup for a few seconds.
+// Writes that change access (role, activation, password, school status) call forgetPrincipal().
+const principalCache = new TtlCache<CachedPrincipal>(Number(process.env.AUTH_CACHE_TTL_MS) || 5_000);
+function forgetPrincipal(userId?: string) { if (userId) principalCache.delete(userId); else principalCache.clear(); }
+
+async function loadPrincipal(userId: string): Promise<CachedPrincipal | null> {
+  const cached = principalCache.get(userId);
+  if (cached) return cached;
+  const row = await prisma.user.findUnique({ where: { id: userId }, include: { school: { select: { isActive: true } } } });
+  if (!row) return null;
+  const { school, passwordHash: _passwordHash, ...user } = row;
+  const principal: CachedPrincipal = { ...user, schoolActive: !user.schoolId || school?.isActive === true };
+  principalCache.set(userId, principal);
+  return principal;
 }
 
 const authenticate = (req: Request, res: Response, next: NextFunction) => {
@@ -58,17 +89,15 @@ const authenticate = (req: Request, res: Response, next: NextFunction) => {
     const token = req.header("authorization")?.match(/^Bearer (.+)$/i)?.[1];
     if (!token) { res.status(401).json({ error: "Bearer token required" }); return; }
     try {
-      const userId = verifyAccessToken(token);
-      if (!userId) { res.status(401).json({ error: "Invalid or expired token" }); return; }
-      const user = await prisma.user.findUnique({ where: { id: userId } });
-      if (!user || !user.isActive) { res.status(403).json({ error: "Account is not active" }); return; }
-      if (user.schoolId) {
-        const school = await prisma.school.findUnique({ where: { id: user.schoolId }, select: { isActive: true } });
-        if (!school?.isActive) { res.status(403).json({ error: "School access is suspended" }); return; }
-      }
+      const claims = verifyAccessToken(token);
+      if (!claims) { res.status(401).json({ error: "Invalid or expired token", code: "session_expired" }); return; }
+      const user = await loadPrincipal(claims.userId);
+      if (!user || claims.version !== user.tokenVersion) { res.status(401).json({ error: "Invalid or expired token", code: "session_expired" }); return; }
+      if (!user.isActive) { res.status(403).json({ error: "Account is not active" }); return; }
+      if (!user.schoolActive) { res.status(403).json({ error: "School access is suspended" }); return; }
       req.principal = user;
       next();
-    } catch { res.status(401).json({ error: "Invalid or expired token" }); }
+    } catch { res.status(401).json({ error: "Invalid or expired token", code: "session_expired" }); }
   })().catch(next);
 };
 
@@ -79,16 +108,20 @@ function allow(...roles: Role[]) {
   };
 }
 
-function signAccessToken(userId: string) {
+const SESSION_TTL_SECONDS = Number(process.env.SESSION_TTL_DAYS ?? 7) * 24 * 60 * 60;
+
+function signAccessToken(user: { id: string; tokenVersion?: number }) {
   if (!authTokenSecret || Buffer.byteLength(authTokenSecret) < 32) throw new Error("AUTH_TOKEN_SECRET must contain at least 32 bytes");
   const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
-  const payload = Buffer.from(JSON.stringify({ sub: userId, iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60 })).toString("base64url");
+  const now = Math.floor(Date.now() / 1000);
+  const payload = Buffer.from(JSON.stringify({ sub: user.id, ver: user.tokenVersion ?? 0, iat: now, exp: now + SESSION_TTL_SECONDS })).toString("base64url");
   const unsigned = `${header}.${payload}`;
   return `${unsigned}.${createHmac("sha256", authTokenSecret).update(unsigned).digest("base64url")}`;
 }
 
-function verifyAccessToken(token: string): string | null {
+function verifyAccessToken(token: string): { userId: string; version: number } | null {
   if (!authTokenSecret || Buffer.byteLength(authTokenSecret) < 32) return null;
+  if (token.length > 4096) return null;
   const parts = token.split(".");
   if (parts.length !== 3) return null;
   const unsigned = `${parts[0]}.${parts[1]}`;
@@ -97,22 +130,25 @@ function verifyAccessToken(token: string): string | null {
   try { supplied = Buffer.from(parts[2], "base64url"); } catch { return null; }
   if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) return null;
   try {
-    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as { sub?: unknown; exp?: unknown };
-    return typeof payload.sub === "string" && typeof payload.exp === "number" && payload.exp > Date.now() / 1000 ? payload.sub : null;
+    const header = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8")) as { alg?: unknown };
+    if (header.alg !== "HS256") return null;
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as { sub?: unknown; exp?: unknown; ver?: unknown };
+    if (typeof payload.sub !== "string" || typeof payload.exp !== "number" || payload.exp <= Date.now() / 1000) return null;
+    // Tokens issued before session revocation existed carry no version and map to 0.
+    return { userId: payload.sub, version: typeof payload.ver === "number" ? payload.ver : 0 };
   } catch { return null; }
 }
 
-function hashPassword(password: string) {
-  const salt = randomBytes(16).toString("base64url");
-  return `${salt}:${scryptSync(password, salt, 64).toString("base64url")}`;
-}
+const hashPassword = hashPasswordAsync;
+const verifyPassword = verifyPasswordAsync;
 
-function verifyPassword(password: string, encoded: string) {
-  const [salt, hash] = encoded.split(":");
-  if (!salt || !hash) return false;
-  const expected = Buffer.from(hash, "base64url");
-  const actual = scryptSync(password, salt, expected.length);
-  return expected.length === actual.length && timingSafeEqual(expected, actual);
+/** Per-IP and per-account throttling for credential endpoints. */
+function credentialThrottle(req: Request, res: Response, scope: string, account: string | undefined, limit = 10) {
+  const ipWait = limiter.hit(`${scope}:ip:${clientIp(req)}`, limit * 3, 15 * 60_000);
+  const accountWait = account ? limiter.hit(`${scope}:acct:${account}`, limit, 15 * 60_000) : 0;
+  const wait = Math.max(ipWait, accountWait);
+  if (wait) { tooMany(res, wait); return false; }
+  return true;
 }
 
 function normalizeSafetyTerm(value: string) {
@@ -159,6 +195,24 @@ async function legacyScope(user: Principal) {
 
 function legacyOwner(data: Record<string, unknown>, userId: string) {
   return ["teacherId", "authorId", "createdBy", "userId", "parentId", "submittedBy", "reviewedBy"].some(key => data[key] === userId);
+}
+
+/**
+ * SQL pre-filter matching the JSON fields canReadLegacy() inspects, so the database
+ * returns only candidate rows. canReadLegacy() still makes the final decision.
+ */
+function legacyScopeWhere(user: Principal, scope: Awaited<ReturnType<typeof legacyScope>>, studentId?: string): Prisma.LegacyRecordWhereInput {
+  if (studentId) return { OR: [{ data: { path: ["studentId"], equals: studentId } }, { data: { path: ["childId"], equals: studentId } }] };
+  if (user.role === Role.ADMIN) return {};
+  const clauses: Prisma.LegacyRecordWhereInput[] = [];
+  const add = (field: string, values: Iterable<string>) => { for (const value of values) clauses.push({ data: { path: [field], equals: value } }); };
+  for (const key of ["teacherId", "authorId", "createdBy", "userId", "parentId", "submittedBy", "reviewedBy"]) add(key, scope.identityIds);
+  add("studentId", scope.childIds);
+  add("childId", scope.childIds);
+  add("classId", scope.classIds);
+  add("schoolId", scope.schoolIds);
+  // Very large scopes fall back to the bounded scan instead of an enormous OR clause.
+  return clauses.length > 0 && clauses.length <= 1500 ? { OR: clauses } : clauses.length ? {} : { id: "__no_scope__" };
 }
 
 async function canReadLegacy(user: Principal, collection: string, data: Record<string, unknown>, scope: Awaited<ReturnType<typeof legacyScope>>) {
@@ -222,7 +276,7 @@ async function emailSchoolInvitation(email: string, schoolName: string, role: Ro
   await sendSendlibEmail({ apiKey: sendlibApiKey, from: sendlibFromEmail, to: email, subject, text, html });
 }
 
-app.post("/api/school-access-requests", asyncRoute(async (req, res) => {
+app.post("/api/school-access-requests", rateLimit("school_request", 5, 60 * 60_000), asyncRoute(async (req, res) => {
   const input = z.object({
     contactName: z.string().trim().min(2).max(160),
     email: z.string().trim().email().max(254).transform(value => value.toLowerCase()),
@@ -406,6 +460,8 @@ app.post("/api/school-invitations/claim", asyncRoute(async (req, res) => {
   const input = z.object({ invitationToken: z.string().min(32).max(128), email: z.string().email().max(254), password: z.string().min(10).max(128), fullName: z.string().trim().min(2).max(160).optional() }).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
   const email = input.data.email.trim().toLowerCase();
+  if (!credentialThrottle(req, res, "invite_claim", email)) return;
+  const passwordHash = await hashPassword(input.data.password);
   const tokenHash = createHash("sha256").update(input.data.invitationToken).digest("hex");
   const result = await prisma.$transaction(async transaction => {
     await transaction.$queryRaw`SELECT "id" FROM "SchoolInvitation" WHERE "tokenHash" = ${tokenHash} FOR UPDATE`;
@@ -416,14 +472,14 @@ app.post("/api/school-invitations/claim", asyncRoute(async (req, res) => {
     if (existingByEmail?.role === Role.ADMIN && existingByEmail.schoolId === null) return null;
     if (existingByEmail?.passwordHash) return null;
     const user = existingByEmail
-      ? await transaction.user.update({ where: { id: existingByEmail.id }, data: { passwordHash: hashPassword(input.data.password), fullName: input.data.fullName || invitation.fullName, phone: invitation.phone ?? existingByEmail.phone, emailVerified: true, role: invitation.role, schoolId: invitation.schoolId, isActive: true } })
-      : await transaction.user.create({ data: { firebaseUid: `pg_${randomBytes(20).toString("hex")}`, email, passwordHash: hashPassword(input.data.password), fullName: input.data.fullName || invitation.fullName, phone: invitation.phone, emailVerified: true, role: invitation.role, schoolId: invitation.schoolId } });
+      ? await transaction.user.update({ where: { id: existingByEmail.id }, data: { passwordHash, fullName: input.data.fullName || invitation.fullName, phone: invitation.phone ?? existingByEmail.phone, emailVerified: true, role: invitation.role, schoolId: invitation.schoolId, isActive: true } })
+      : await transaction.user.create({ data: { firebaseUid: `pg_${randomBytes(20).toString("hex")}`, email, passwordHash, fullName: input.data.fullName || invitation.fullName, phone: invitation.phone, emailVerified: true, role: invitation.role, schoolId: invitation.schoolId } });
     await transaction.schoolInvitation.update({ where: { id: invitation.id }, data: { usedAt: new Date() } });
     await transaction.auditLog.create({ data: { actorId: user.id, action: "school_invitation.claim", entityType: "school", entityId: invitation.schoolId, details: { role: invitation.role } } });
     return { user, role: invitation.role };
   });
   if (!result) { res.status(400).json({ error: "Mwaliko si sahihi, umetumika, au email/akaunti haiendani" }); return; }
-  res.json({ joined: true, role: result.role, schoolId: result.user.schoolId, token: signAccessToken(result.user.id), user: publicUser(result.user) });
+  res.json({ joined: true, role: result.role, schoolId: result.user.schoolId, token: signAccessToken(result.user), user: publicUser(result.user) });
 }));
 
 app.post("/api/auth/email-otp/request", asyncRoute(async (req, res) => {
@@ -432,6 +488,7 @@ app.post("/api/auth/email-otp/request", asyncRoute(async (req, res) => {
   const emailProviderConfigured = !!sendlibApiKey;
   if (!emailProviderConfigured || !otpHashSecret || Buffer.byteLength(otpHashSecret) < 32) { res.status(503).json({ error: "Email verification is not configured" }); return; }
   const { email, fullName, phone } = input.data;
+  if (!credentialThrottle(req, res, "otp_request", email, 6)) return;
   const existingUser = await prisma.user.findUnique({ where: { email }, select: { emailVerified: true, passwordHash: true, fullName: true } });
   if (input.data.purpose === "registration" && existingUser?.emailVerified && existingUser.passwordHash) { res.status(409).json({ error: "Email is already registered" }); return; }
   if (input.data.purpose === "password_reset" && !existingUser?.passwordHash) { res.status(202).json({ sent: true, expiresInSeconds: 600, resendAfterSeconds: 60 }); return; }
@@ -473,6 +530,7 @@ app.post("/api/auth/email-otp/verify", asyncRoute(async (req, res) => {
   const input = z.object({ email: z.string().email().max(254).transform(value => value.trim().toLowerCase()), code: z.string().regex(/^\d{6}$/) }).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
   const { email, code } = input.data;
+  if (!credentialThrottle(req, res, "otp_verify", email, 15)) return;
   const now = new Date();
   const result = await prisma.$transaction(async transaction => {
     const row = await transaction.emailOtpVerification.findUnique({ where: { email } });
@@ -499,6 +557,8 @@ app.post("/api/auth/email-otp/verify", asyncRoute(async (req, res) => {
 app.post("/api/auth/password-reset/confirm", asyncRoute(async (req, res) => {
   const input = z.object({ email: z.string().email().max(254).transform(value => value.trim().toLowerCase()), password: z.string().min(10).max(128) }).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
+  if (!credentialThrottle(req, res, "password_reset", input.data.email)) return;
+  const passwordHash = await hashPassword(input.data.password);
   const now = new Date();
   const user = await prisma.$transaction(async transaction => {
     await transaction.$queryRaw`SELECT "email" FROM "EmailOtpVerification" WHERE "email" = ${input.data.email} FOR UPDATE`;
@@ -506,18 +566,22 @@ app.post("/api/auth/password-reset/confirm", asyncRoute(async (req, res) => {
     if (!verification?.verifiedAt || !verification.registrationExpiresAt || verification.registrationExpiresAt <= now || verification.consumedAt) return null;
     const existing = await transaction.user.findUnique({ where: { email: input.data.email } });
     if (!existing?.passwordHash) return null;
-    const updated = await transaction.user.update({ where: { id: existing.id }, data: { passwordHash: hashPassword(input.data.password) } });
+    // Resetting a password signs out every existing session (e.g. a stolen phone).
+    const updated = await transaction.user.update({ where: { id: existing.id }, data: { passwordHash, tokenVersion: { increment: 1 } } });
     await transaction.emailOtpVerification.update({ where: { email: input.data.email }, data: { consumedAt: now } });
     await transaction.auditLog.create({ data: { actorId: updated.id, action: "auth.password_reset", entityType: "user", entityId: updated.id } });
     return updated;
   });
   if (!user) { res.status(400).json({ error: "Verified reset code is missing or expired" }); return; }
+  forgetPrincipal(user.id);
   res.json({ reset: true });
 }));
 
 app.post("/api/auth/register", asyncRoute(async (req, res) => {
   const input = z.object({ email: z.string().email().max(254).transform(value => value.trim().toLowerCase()), password: z.string().min(10).max(128) }).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
+  if (!credentialThrottle(req, res, "register", input.data.email)) return;
+  const passwordHash = await hashPassword(input.data.password);
   const now = new Date();
   const result = await prisma.$transaction(async transaction => {
     await transaction.$queryRaw`SELECT "email" FROM "EmailOtpVerification" WHERE "email" = ${input.data.email} FOR UPDATE`;
@@ -527,7 +591,7 @@ app.post("/api/auth/register", asyncRoute(async (req, res) => {
     if (duplicate) return null;
     const user = await transaction.user.create({ data: {
       firebaseUid: `pg_${randomBytes(20).toString("hex")}`,
-      email: input.data.email, passwordHash: hashPassword(input.data.password),
+      email: input.data.email, passwordHash,
       fullName: verification.fullName, phone: verification.phone, emailVerified: true, role: Role.PARENT,
     } });
     await transaction.emailOtpVerification.update({ where: { email: input.data.email }, data: { consumedAt: now } });
@@ -535,15 +599,19 @@ app.post("/api/auth/register", asyncRoute(async (req, res) => {
     return user;
   });
   if (!result) { res.status(409).json({ error: "Email verification is missing or expired, or this email already has an account" }); return; }
-  res.status(201).json({ token: signAccessToken(result.id), user: publicUser(result) });
+  res.status(201).json({ token: signAccessToken(result), user: publicUser(result) });
 }));
 
 app.post("/api/auth/login", asyncRoute(async (req, res) => {
   const input = z.object({ email: z.string().email().max(254).transform(value => value.trim().toLowerCase()), password: z.string().min(1).max(128) }).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
+  if (!credentialThrottle(req, res, "login", input.data.email)) return;
   const user = await prisma.user.findUnique({ where: { email: input.data.email } });
-  if (!user?.passwordHash) { res.status(401).json({ error: "Account password is not set. Use email verification to migrate this account first." }); return; }
-  if (!verifyPassword(input.data.password, user.passwordHash)) { res.status(401).json({ error: "Email or password is incorrect" }); return; }
+  // Same message and similar timing whether or not the account exists, to prevent email enumeration.
+  const invalidCredentials = "Email or password is incorrect. If you used KidGuard before the upgrade, reset your password with email verification.";
+  if (!user?.passwordHash) { await burnPasswordCheck(input.data.password); res.status(401).json({ error: invalidCredentials, code: "invalid_credentials" }); return; }
+  if (!await verifyPassword(input.data.password, user.passwordHash)) { res.status(401).json({ error: invalidCredentials, code: "invalid_credentials" }); return; }
+  limiter.reset(`login:acct:${input.data.email}`);
   if (!user.emailVerified) { res.status(403).json({ error: "Verify your email before signing in" }); return; }
   if (!user.isActive) { res.status(403).json({ error: "This account is disabled" }); return; }
   if (user.schoolId) {
@@ -551,13 +619,14 @@ app.post("/api/auth/login", asyncRoute(async (req, res) => {
     if (!school?.isActive) { res.status(403).json({ error: "School access is suspended" }); return; }
   }
   await prisma.auditLog.create({ data: { actorId: user.id, action: "auth.login", entityType: "user", entityId: user.id } });
-  res.json({ token: signAccessToken(user.id), user: publicUser(user) });
+  res.json({ token: signAccessToken(user), user: publicUser(user) });
 }));
 
 app.post("/api/auth/google", asyncRoute(async (req, res) => {
   const input = z.object({ idToken: z.string().min(100).max(8192) }).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
   if (!googleClientIds.length) { res.status(503).json({ error: "Google sign-in is not configured" }); return; }
+  if (!credentialThrottle(req, res, "google", undefined, 20)) return;
   let payload;
   try {
     payload = (await new OAuth2Client().verifyIdToken({ idToken: input.data.idToken, audience: googleClientIds })).getPayload();
@@ -574,12 +643,14 @@ app.post("/api/auth/google", asyncRoute(async (req, res) => {
     if (!school?.isActive) { res.status(403).json({ error: "School access is suspended" }); return; }
   }
   await prisma.user.update({ where: { id: user.id }, data: { emailVerified: true, profileImageUrl: user.profileImageUrl ?? payload.picture } });
-  res.json({ token: signAccessToken(user.id), user: publicUser(user) });
+  res.json({ token: signAccessToken(user), user: publicUser(user) });
 }));
 
 app.post("/api/auth/migrate-password", asyncRoute(async (req, res) => {
   const input = z.object({ email: z.string().email().max(254).transform(value => value.trim().toLowerCase()), password: z.string().min(10).max(128) }).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
+  if (!credentialThrottle(req, res, "migrate_password", input.data.email)) return;
+  const passwordHash = await hashPassword(input.data.password);
   const now = new Date();
   const user = await prisma.$transaction(async transaction => {
     await transaction.$queryRaw`SELECT "email" FROM "EmailOtpVerification" WHERE "email" = ${input.data.email} FOR UPDATE`;
@@ -587,13 +658,13 @@ app.post("/api/auth/migrate-password", asyncRoute(async (req, res) => {
     if (!verification?.verifiedAt || !verification.registrationExpiresAt || verification.registrationExpiresAt <= now || verification.consumedAt) return null;
     const existing = await transaction.user.findUnique({ where: { email: input.data.email } });
     if (!existing || existing.passwordHash) return null;
-    const updated = await transaction.user.update({ where: { id: existing.id }, data: { passwordHash: hashPassword(input.data.password), emailVerified: true } });
+    const updated = await transaction.user.update({ where: { id: existing.id }, data: { passwordHash, emailVerified: true } });
     await transaction.emailOtpVerification.update({ where: { email: input.data.email }, data: { consumedAt: now } });
     await transaction.auditLog.create({ data: { actorId: updated.id, action: "auth.password_migrated", entityType: "user", entityId: updated.id } });
     return updated;
   });
   if (!user) { res.status(409).json({ error: "No eligible legacy account or verified email code was found" }); return; }
-  res.json({ token: signAccessToken(user.id), user: publicUser(user) });
+  res.json({ token: signAccessToken(user), user: publicUser(user) });
 }));
 
 app.get("/", (_req, res) => res.json({
@@ -603,6 +674,19 @@ app.get("/", (_req, res) => res.json({
 }));
 
 app.get("/health", (_req, res) => res.json({ status: "ok", service: "kidguard-api" }));
+// Readiness probe used by Docker: fails when PostgreSQL is unreachable.
+app.get("/health/ready", asyncRoute(async (_req, res) => {
+  try { await prisma.$queryRaw`SELECT 1`; res.json({ status: "ok", database: "ok" }); }
+  catch { res.status(503).json({ status: "degraded", database: "unreachable" }); }
+}));
+
+// Signs out every device for the current account, e.g. after losing a phone.
+app.post("/api/auth/logout-all", authenticate, asyncRoute(async (req, res) => {
+  await prisma.user.update({ where: { id: req.principal!.id }, data: { tokenVersion: { increment: 1 } } });
+  forgetPrincipal(req.principal!.id);
+  await prisma.auditLog.create({ data: { actorId: req.principal!.id, action: "auth.logout_all", entityType: "user", entityId: req.principal!.id } });
+  res.json({ signedOut: true });
+}));
 
 const aiDefaultSettings = {
   enabled: false, voiceEnabled: true, voiceNotificationsEnabled: true,
@@ -684,11 +768,52 @@ app.delete("/api/ai/conversations/:conversationId", authenticate, asyncRoute(asy
   res.json({ deleted: true });
 }));
 
+app.post("/api/ai/voice/transcribe", authenticate, express.raw({ type: "audio/wav", limit: "8mb" }), asyncRoute(async (req, res) => {
+  const user = req.principal!;
+  const settings = await prisma.aIGuardianSettings.findUnique({ where: { userId: user.id }, select: { enabled: true } });
+  const parsed = guardianTranscriptionSchema.safeParse({ language: req.header("x-kidguard-language") ?? "auto" });
+  const childId = req.header("x-kidguard-child-id");
+  if (!parsed.success || (childId && childId.length > 200)) {
+    res.status(400).json({ error: "Invalid voice request." }); return;
+  }
+  const voiceAuthorized = await guardianVoiceAuthorizationAllowed({
+    role: user.role, schoolId: user.schoolId, enabled: settings?.enabled === true,
+    childId: childId ?? undefined, hasChildAccess: id => canAccessChild(user, id),
+  });
+  if (!voiceAuthorized) {
+    res.status(403).json({ error: "Voice request is outside your authorized child scope" }); return;
+  }
+  if (!Buffer.isBuffer(req.body) || !req.body.length) { res.status(400).json({ error: "Record a voice question before sending it." }); return; }
+  const now = new Date();
+  const bucketStart = new Date(Math.floor(now.getTime() / 60_000) * 60_000);
+  const bucket = await prisma.aIGuardianRateLimitBucket.upsert({
+    where: { userId_bucketStart: { userId: user.id, bucketStart } },
+    create: { userId: user.id, bucketStart, requests: 1 },
+    update: { requests: { increment: 1 } }, select: { requests: true },
+  });
+  if (bucket.requests > AI_MAX_REQUESTS_PER_MINUTE) { res.status(429).json({ error: "Too many AI requests. Try again in a minute." }); return; }
+  const config = resolveAiAssistantConfiguration(process.env.AI_ASSISTANT_HOST, process.env.AI_ASSISTANT_SHARED_SECRET);
+  if (!config.ok) { res.status(503).json({ error: "Guardian Voice is not configured.", code: "voice_not_configured" }); return; }
+  const cancellation = new AbortController();
+  req.on("aborted", () => cancellation.abort());
+  res.on("close", () => { if (!res.writableEnded) cancellation.abort(); });
+  try {
+    const result = await transcribeGuardianVoice({ host: config.serviceUrl, secret: config.sharedSecret, audio: req.body, language: parsed.data.language, signal: cancellation.signal });
+    res.setHeader("Cache-Control", "no-store");
+    res.json(result);
+  } catch (error) {
+    const code = error instanceof GuardianVoiceError ? error.code : "voice_unavailable";
+    if (code === "voice_cancelled" || res.destroyed) return;
+    if (code === "voice_not_configured") console.error("Guardian Voice service is not configured");
+    res.status(code === "voice_provider_timeout" ? 504 : code === "voice_not_configured" ? 503 : 502).json({ error: "Speech recognition is unavailable right now.", code });
+  }
+}));
+
 app.post("/api/ai/tts", authenticate, asyncRoute(async (req, res) => {
   const user = req.principal!;
-  if (!canUseAiGuardian(user.role, user.schoolId)) { res.status(403).json({ error: "AI Guardian is not available for this account" }); return; }
   const settings = await prisma.aIGuardianSettings.findUnique({ where: { userId: user.id }, select: { enabled: true } });
-  if (!settings?.enabled) { res.status(403).json({ error: "AI Guardian is disabled" }); return; }
+  const voiceAuthorized = await guardianVoiceAuthorizationAllowed({ role: user.role, schoolId: user.schoolId, enabled: settings?.enabled === true, hasChildAccess: async () => false });
+  if (!voiceAuthorized) { res.status(403).json({ error: "AI Guardian is not available for this account" }); return; }
   const input = guardianVoiceInputSchema.safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: "Voice text, language, voice or speech rate is invalid." }); return; }
   const now = new Date();
@@ -700,16 +825,20 @@ app.post("/api/ai/tts", authenticate, asyncRoute(async (req, res) => {
   });
   if (bucket.requests > AI_MAX_REQUESTS_PER_MINUTE) { res.status(429).json({ error: "Too many AI requests. Try again in a minute." }); return; }
   void prisma.aIGuardianRateLimitBucket.deleteMany({ where: { bucketStart: { lt: new Date(now.getTime() - 2 * 60 * 60_000) } } }).catch(() => undefined);
+  const cancellation = new AbortController();
+  req.on("aborted", () => cancellation.abort());
+  res.on("close", () => { if (!res.writableEnded) cancellation.abort(); });
   try {
-    const audio = await synthesizeGuardianVoice({ key: process.env.AZURE_SPEECH_KEY, region: process.env.AZURE_SPEECH_REGION, ...input.data });
-    res.setHeader("Content-Type", "audio/mpeg");
+    const audio = await synthesizeGuardianVoice({ host: process.env.AI_ASSISTANT_HOST, secret: process.env.AI_ASSISTANT_SHARED_SECRET, ...input.data, signal: cancellation.signal });
+    res.setHeader("Content-Type", "audio/wav");
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.status(200).send(Buffer.from(audio));
   } catch (error) {
     const code = error instanceof GuardianVoiceError ? error.code : "voice_unavailable";
+    if (code === "voice_cancelled" || res.destroyed) return;
     if (code === "voice_not_configured") console.error("Guardian Voice provider is not configured");
-    res.status(code === "voice_not_configured" ? 503 : 502).json({ error: "Guardian Voice is not available right now.", code });
+    res.status(code === "voice_provider_timeout" ? 504 : code === "voice_not_configured" ? 503 : 502).json({ error: "Guardian Voice is not available right now.", code });
   }
 }));
 
@@ -722,10 +851,12 @@ app.post("/api/ai/chat", authenticate, asyncRoute(async (req, res) => {
   const shouldPersist = settings.saveConversations;
   let userMessage: string | null = null;
   let messages: ReturnType<typeof validateChatMessages> = null;
+  let responseLanguage = settings.language;
   if (shouldPersist) {
-    const input = z.object({ conversationId: z.string().min(1).max(200).optional(), message: z.string().trim().min(1).max(1000) }).strict().safeParse(req.body);
+    const input = z.object({ conversationId: z.string().min(1).max(200).optional(), message: z.string().trim().min(1).max(1000), language: z.enum(["sw", "en"]).optional() }).strict().safeParse(req.body);
     if (!input.success) { res.status(400).json({ error: "Send one message of at most 1,000 characters." }); return; }
     userMessage = input.data.message;
+    responseLanguage = input.data.language ?? settings.language;
     conversationId = input.data.conversationId ?? null;
     if (conversationId) {
       const owned = await prisma.aIConversation.findFirst({ where: ownedConversationWhere(user.id, conversationId), select: { id: true, _count: { select: { messages: true } } } });
@@ -737,7 +868,10 @@ app.post("/api/ai/chat", authenticate, asyncRoute(async (req, res) => {
       messages = [{ role: "user", content: userMessage }];
     }
   } else {
-    messages = validateChatMessages(req.body?.messages);
+    const input = z.object({ messages: z.unknown(), language: z.enum(["sw", "en"]).optional() }).strict().safeParse(req.body);
+    if (!input.success) { res.status(400).json({ error: "Invalid conversation. Keep up to 12 messages and 6,000 characters." }); return; }
+    responseLanguage = input.data.language ?? settings.language;
+    messages = validateChatMessages(input.data.messages);
   }
   if (!messages) { res.status(400).json({ error: "Invalid conversation. Keep up to 12 messages and 6,000 characters." }); return; }
   const aiConfiguration = resolveAiAssistantConfiguration(
@@ -1055,7 +1189,7 @@ app.post("/api/ai/chat", authenticate, asyncRoute(async (req, res) => {
   };
   let answer: string;
   try {
-    answer = await requestAiAssistant({ serviceUrl: aiServiceUrl, sharedSecret: aiServiceSecret, messages, context: boundAiContext(context), language: settings.language });
+    answer = await requestAiAssistant({ serviceUrl: aiServiceUrl, sharedSecret: aiServiceSecret, messages, context: boundAiContext(context), language: responseLanguage });
   } catch (error) {
     if (error instanceof AiAssistantRequestError) {
       console.error("KidGuard AI provider failure", { code: error.code, status: error.providerStatus });
@@ -1108,7 +1242,7 @@ app.get("/api/records/:collection", authenticate, asyncRoute(async (req, res) =>
   const requestedStudent = typeof req.query.studentId === "string" ? req.query.studentId : undefined;
   if (requestedStudent && !scope.childIds.has(requestedStudent) && req.principal!.role !== Role.ADMIN) { res.status(403).json({ error: "Student is outside your authorized scope" }); return; }
   const limit = Math.min(500, Math.max(1, Number.parseInt(String(req.query.limit ?? "200"), 10) || 200));
-  const records = await prisma.legacyRecord.findMany({ where: { collection }, orderBy: { updatedAt: "desc" }, take: 2000 });
+  const records = await prisma.legacyRecord.findMany({ where: { collection, ...legacyScopeWhere(req.principal!, scope, requestedStudent) }, orderBy: { updatedAt: "desc" }, take: 2000 });
   const rows = [];
   for (const record of records) {
     const data = objectData(record.data);
@@ -1154,10 +1288,15 @@ app.patch("/api/records/:collection/:recordId", authenticate, asyncRoute(async (
   const oldData = objectData(record.data);
   const readOnlyMark = collection === "announcements" && Object.keys(input.data).every(key => key === "readBy") && await canReadLegacy(user, collection, oldData, scope);
   if (!readOnlyMark && !await canWriteLegacy(user, collection, oldData, scope)) { res.status(403).json({ error: "You cannot update this record" }); return; }
-  const merged = { ...oldData, ...input.data };
+  const merged: Record<string, unknown> = { ...oldData, ...input.data };
   if (readOnlyMark) {
     const readBy = Array.isArray(oldData.readBy) ? oldData.readBy.map(String) : [];
     merged.readBy = [...new Set([...readBy, user.firebaseUid])];
+  } else {
+    // Ownership/scope fields are server-controlled; a writer cannot re-home a record.
+    for (const key of ["schoolId", "teacherId", "parentId", "userId", "authorId"]) if (key in oldData) merged[key] = oldData[key];
+    if (user.role === Role.TEACHER) merged.schoolId = user.schoolId;
+    if (!await canWriteLegacy(user, collection, merged, scope)) { res.status(403).json({ error: "You cannot update this record" }); return; }
   }
   const updated = await prisma.legacyRecord.update({ where: { collection_sourceId: { collection, sourceId: record.sourceId } }, data: { data: merged as Prisma.InputJsonValue } });
   res.json({ record: { id: updated.sourceId, ...merged } });
@@ -1191,6 +1330,7 @@ app.post("/api/admin/schools", authenticate, allow(Role.ADMIN), asyncRoute(async
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
   if (req.principal!.schoolId && req.principal!.schoolId !== input.data.id) { res.status(403).json({ error: "Admin can manage only their assigned school" }); return; }
   const { id, ...data } = input.data;
+  if (data.settings && req.principal!.schoolId && Object.keys(data.settings).length > 50) { res.status(400).json({ error: "Too many school settings" }); return; }
   const school = id
     ? await prisma.school.upsert({ where: { id }, create: { id, ...data, settings: data.settings as Prisma.InputJsonValue }, update: { ...data, settings: data.settings as Prisma.InputJsonValue } })
     : await prisma.school.create({ data: { ...data, settings: data.settings as Prisma.InputJsonValue } });
@@ -1205,6 +1345,7 @@ app.patch("/api/admin/schools/:schoolId", authenticate, allow(Role.ADMIN), async
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
   const { settings, ...schoolFields } = input.data;
   const school = await prisma.school.update({ where: { id: schoolId }, data: { ...schoolFields, ...(settings ? { settings: settings as Prisma.InputJsonValue } : {}) } });
+  if (schoolFields.isActive !== undefined) forgetPrincipal();
   await prisma.auditLog.create({ data: { actorId: req.principal!.id, action: "school.update", entityType: "school", entityId: school.id } });
   res.json({ school });
 }));
@@ -1232,6 +1373,10 @@ app.post("/api/admin/schools/:schoolId/classes", authenticate, allow(Role.ADMIN)
   const input = z.object({ id: z.string().optional(), name: z.string().trim().min(1).max(100), gradeLevel: z.string().max(40).optional(), academicYear: z.string().max(30).optional(), settings: z.record(z.unknown()).default({}) }).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
   const { id, ...data } = input.data;
+  if (id) {
+    const current = await prisma.schoolClass.findUnique({ where: { id }, select: { schoolId: true } });
+    if (current && current.schoolId !== schoolId) { res.status(403).json({ error: "Class belongs to another school" }); return; }
+  }
   const values = { schoolId, ...data, settings: data.settings as Prisma.InputJsonValue };
   const schoolClass = id
     ? await prisma.schoolClass.upsert({ where: { id }, create: { id, ...values }, update: values })
@@ -1347,7 +1492,8 @@ app.patch("/api/platform/users/:firebaseUid", authenticate, requirePlatformAdmin
     const activeGlobalAdmins = await prisma.user.count({ where: { role: Role.ADMIN, schoolId: null, isActive: true } });
     if (activeGlobalAdmins <= 1) { res.status(409).json({ error: "Cannot remove the last active platform administrator" }); return; }
   }
-  const updated = await prisma.user.update({ where: { firebaseUid }, data: { ...input.data } });
+  const updated = await prisma.user.update({ where: { firebaseUid }, data: { ...input.data, ...(input.data.isActive === false ? { tokenVersion: { increment: 1 } } : {}) } });
+  forgetPrincipal(updated.id);
   await prisma.auditLog.create({ data: { actorId: req.principal!.id, action: "platform.user.update", entityType: "user", entityId: updated.id, details: { changedFields: Object.keys(input.data), role: updated.role, schoolId: updated.schoolId, isActive: updated.isActive } } });
   res.json({ user: publicUser(updated) });
 }));
@@ -1362,6 +1508,7 @@ app.patch("/api/platform/schools/:schoolId", authenticate, requirePlatformAdmin,
   const input = z.object({ isActive: z.boolean().optional(), name: z.string().trim().min(2).max(160).optional() }).refine(value => Object.keys(value).length > 0).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
   const school = await prisma.school.update({ where: { id: schoolId }, data: input.data });
+  forgetPrincipal();
   await prisma.auditLog.create({ data: { actorId: req.principal!.id, action: "platform.school.update", entityType: "school", entityId: school.id, details: input.data } });
   res.json({ school });
 }));
@@ -1454,11 +1601,19 @@ app.post("/api/admin/users", authenticate, allow(Role.ADMIN), asyncRoute(async (
   const value = input.data;
   const schoolId = value.schoolId ?? req.principal!.schoolId ?? undefined;
   if (req.principal!.schoolId && schoolId !== req.principal!.schoolId) { res.status(403).json({ error: "School is outside your authorized scope" }); return; }
+  if (value.firebaseUid && req.principal!.schoolId) { res.status(403).json({ error: "Only platform administrators can set legacy identifiers" }); return; }
   const normalizedEmail = value.email.trim().toLowerCase();
   const existing = await prisma.user.findUnique({ where: { email: normalizedEmail } });
+  // An existing account may only be adopted if it has never set a password, is not an
+  // administrator, and does not already belong to a different school.
+  if (existing && (existing.passwordHash || existing.role === Role.ADMIN || (existing.schoolId && existing.schoolId !== schoolId))) {
+    res.status(409).json({ error: "This email already belongs to an active account. Invite the user instead." }); return;
+  }
+  const passwordHash = await hashPassword(value.password);
   const user = existing
-    ? await prisma.user.update({ where: { id: existing.id }, data: { fullName: value.fullName, phone: value.phone, emailVerified: true, role: value.role, schoolId, ...(!existing.passwordHash ? { passwordHash: hashPassword(value.password) } : {}) } })
-    : await prisma.user.create({ data: { firebaseUid: value.firebaseUid ?? `pg_${randomBytes(20).toString("hex")}`, email: normalizedEmail, passwordHash: hashPassword(value.password), fullName: value.fullName, phone: value.phone, emailVerified: true, role: value.role, schoolId } });
+    ? await prisma.user.update({ where: { id: existing.id }, data: { fullName: value.fullName, phone: value.phone, emailVerified: true, role: value.role, schoolId, passwordHash } })
+    : await prisma.user.create({ data: { firebaseUid: value.firebaseUid ?? `pg_${randomBytes(20).toString("hex")}`, email: normalizedEmail, passwordHash, fullName: value.fullName, phone: value.phone, emailVerified: true, role: value.role, schoolId } });
+  forgetPrincipal(user.id);
   await prisma.auditLog.create({ data: { actorId: req.principal!.id, action: "user.provision", entityType: "user", entityId: user.id, details: { role: user.role, schoolId: user.schoolId } } });
   res.status(201).json({ id: user.id, role: user.role });
 }));
@@ -1534,6 +1689,7 @@ app.post("/api/me/email-otp/verify", authenticate, asyncRoute(async (req, res) =
       const collision = await transaction.user.findUnique({ where: { email }, select: { id: true } });
       if (collision && collision.id !== userId) return { error: "Email is already registered", status: 409 };
       const user = await transaction.user.update({ where: { id: userId }, data: { email, emailVerified: true } });
+      forgetPrincipal(userId);
       await transaction.emailChangeVerification.delete({ where: { userId } });
       await transaction.auditLog.create({ data: { actorId: userId, action: "user.email_changed", entityType: "user", entityId: userId } });
       return { user };
@@ -1552,6 +1708,7 @@ app.patch("/api/me", authenticate, asyncRoute(async (req, res) => {
   if ((input.data.isPremium !== undefined || input.data.premiumExpiry !== undefined) && req.principal!.role !== Role.ADMIN) { res.status(403).json({ error: "Premium status requires administrator authorization" }); return; }
   const { preferences, premiumExpiry, ...fields } = input.data;
   const user = await prisma.user.update({ where: { id: req.principal!.id }, data: { ...fields, ...(preferences ? { preferences: preferences as Prisma.InputJsonValue } : {}), ...(premiumExpiry !== undefined ? { premiumExpiry: premiumExpiry ? new Date(premiumExpiry) : null } : {}) } });
+  forgetPrincipal(user.id);
   await prisma.auditLog.create({ data: { actorId: req.principal!.id, action: "user.profile_update", entityType: "user", entityId: user.id } });
   res.json({ user: publicUser(user) });
 }));
@@ -1592,6 +1749,7 @@ app.delete("/api/me", authenticate, asyncRoute(async (req, res) => {
     await transaction.auditLog.create({ data: { action: "user.account_delete", entityType: "user", details: { firebaseUidHash } } });
     await transaction.user.delete({ where: { id } });
   });
+  forgetPrincipal(id);
   res.status(204).end();
 }));
 
@@ -1613,6 +1771,7 @@ app.patch("/api/admin/users/:firebaseUid/access", authenticate, allow(Role.ADMIN
     res.status(404).json({ error: "Teacher not found in your school" }); return;
   }
   const updated = await prisma.user.update({ where: { id: user.id }, data: { isActive: input.data.isActive } });
+  forgetPrincipal(updated.id);
   await prisma.auditLog.create({ data: { actorId: req.principal!.id, action: input.data.isActive ? "teacher.activate" : "teacher.suspend", entityType: "user", entityId: updated.id, details: { schoolId: updated.schoolId } } });
   res.json({ id: updated.firebaseUid, isActive: updated.isActive });
 }));
@@ -1721,6 +1880,9 @@ app.post("/api/children", authenticate, allow(Role.ADMIN, Role.TEACHER, Role.PAR
 app.post("/api/children/link", authenticate, allow(Role.PARENT), asyncRoute(async (req, res) => {
   const input = z.object({ childCode: z.string().trim().min(4).max(128), childName: z.string().trim().min(1).max(160) }).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
+  // Pairing codes can be short; stop parents' accounts from guessing them.
+  const linkWait = limiter.hit(`child_link:${req.principal!.id}`, 10, 15 * 60_000);
+  if (linkWait) { tooMany(res, linkWait); return; }
   const child = await prisma.child.findFirst({ where: { linkCode: input.data.childCode, fullName: { equals: input.data.childName, mode: "insensitive" }, isActive: true } });
   if (!child) { res.status(404).json({ error: "Child not found. Check the pairing code and name." }); return; }
   await prisma.parentChild.upsert({ where: { parentId_childId: { parentId: req.principal!.id, childId: child.id } }, create: { parentId: req.principal!.id, childId: child.id }, update: {} });
@@ -1809,7 +1971,7 @@ app.post("/api/device-links", authenticate, allow(Role.ADMIN, Role.TEACHER, Role
 }));
 
 // A valid short-lived QR token can reveal only the authorized account email and child label for pairing.
-app.post("/api/device-links/preview", asyncRoute(async (req, res) => {
+app.post("/api/device-links/preview", rateLimit("pairing_preview", 30, 15 * 60_000), asyncRoute(async (req, res) => {
   const input = z.object({ token: z.string().min(20).max(200) }).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: "Invalid pairing token" }); return; }
   const tokenHash = createHash("sha256").update(input.data.token).digest("hex");
@@ -1890,7 +2052,7 @@ app.post("/api/device-links/register", authenticate, allow(Role.ADMIN, Role.TEAC
   res.status(201).json({ id: device.device.id, childId: device.childId, parentId: device.ownerId, status: device.device.status });
 }));
 
-app.post("/api/device-monitoring/config", asyncRoute(async (req, res) => {
+app.post("/api/device-monitoring/config", rateLimit("device_config", 120, 60_000), asyncRoute(async (req, res) => {
   const input = z.object({ deviceId: z.string().min(1), childId: z.string().min(1), deviceSecret: z.string().min(24).max(200) }).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: "Invalid device credentials" }); return; }
   const device = await prisma.device.findUnique({ where: { id: input.data.deviceId } });
@@ -1902,7 +2064,7 @@ app.post("/api/device-monitoring/config", asyncRoute(async (req, res) => {
   res.json({ terms });
 }));
 
-app.post("/api/device-events", asyncRoute(async (req, res) => {
+app.post("/api/device-events", rateLimit("device_events", 240, 60_000), asyncRoute(async (req, res) => {
   const input = z.object({ deviceId: z.string().min(1), childId: z.string().min(1), deviceSecret: z.string().min(24).max(200), type: z.enum(["blocked_content", "app_usage_summary", "tamper_event", "device_heartbeat", "location_update"]), payload: z.record(z.unknown()).default({}) }).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
   const event = input.data;
@@ -2084,8 +2246,8 @@ app.post("/api/notifications/child-parents", authenticate, allow(Role.ADMIN, Rol
   const links = await prisma.parentChild.findMany({ where: { childId, parent: { isActive: true } }, select: { parentId: true } });
   const voiceMetadata = classifyNotificationVoice(type);
   const rows = await prisma.notification.createManyAndReturn({ data: links.map(({ parentId }) => ({ recipientId: parentId, childId, title, body, type, payload: payload as Prisma.InputJsonValue, ...voiceMetadata })) });
-  await Promise.all(rows.map(row => deliver(row.id, row.recipientId, title, body, { ...payload, ...voiceMetadata })));
   res.status(201).json({ created: rows.length });
+  void runWithConcurrency(rows, 10, row => deliver(row.id, row.recipientId, title, body, { ...payload, ...voiceMetadata }));
 }));
 
 app.post("/api/notifications/broadcast", authenticate, allow(Role.ADMIN, Role.TEACHER), asyncRoute(async (req, res) => {
@@ -2106,8 +2268,8 @@ app.post("/api/notifications/broadcast", authenticate, allow(Role.ADMIN, Role.TE
   const voiceMetadata = classifyNotificationVoice(type);
   const rows = await prisma.notification.createManyAndReturn({ data: recipients.map(({ id }) => ({ recipientId: id, childId, title, body, type, payload: payload as Prisma.InputJsonValue, ...voiceMetadata })) });
   await prisma.auditLog.create({ data: { actorId: req.principal!.id, action: "notification.broadcast", entityType: "notification", details: { recipients: rows.length, roles: [...roles], schoolId: schoolId ?? null } } });
-  await Promise.all(rows.map(row => deliver(row.id, row.recipientId, title, body, { ...payload, ...voiceMetadata })));
   res.status(201).json({ created: rows.length });
+  void runWithConcurrency(rows, 10, row => deliver(row.id, row.recipientId, title, body, { ...payload, ...voiceMetadata }));
 }));
 
 app.delete("/api/notifications/:id", authenticate, asyncRoute(async (req, res) => {
@@ -2119,9 +2281,7 @@ app.delete("/api/notifications/:id", authenticate, asyncRoute(async (req, res) =
 app.post("/api/notifications/delete-related", authenticate, asyncRoute(async (req, res) => {
   const filters = z.record(z.string()).safeParse(req.body);
   if (!filters.success || !Object.keys(filters.data).length || Object.keys(filters.data).some(key => !["announcementId", "resultId", "feedbackId", "activityId"].includes(key))) { res.status(400).json({ error: "Invalid notification reference filter" }); return; }
-  const rows = await prisma.notification.findMany({ where: { recipientId: req.principal!.id }, select: { id: true, payload: true } });
-  const ids = rows.filter(row => Object.entries(filters.data).some(([key, value]) => (row.payload as Record<string, unknown>)[key] === value)).map(row => row.id);
-  const result = await prisma.notification.deleteMany({ where: { recipientId: req.principal!.id, id: { in: ids } } });
+  const result = await prisma.notification.deleteMany({ where: { recipientId: req.principal!.id, OR: Object.entries(filters.data).map(([key, value]) => ({ payload: { path: [key], equals: value } })) } });
   res.json({ deleted: result.count });
 }));
 
@@ -2129,17 +2289,23 @@ app.post("/api/devices/push-token", authenticate, asyncRoute(async (req, res) =>
   const input = z.object({ token: z.string().min(16), platform: z.enum(["ANDROID", "IOS", "WINDOWS", "MACOS", "WEB"]), name: z.string().max(120).default("KidGuard device"), model: z.string().max(120).optional(), osVersion: z.string().max(120).optional() }).safeParse(req.body);
   if (!input.success) { res.status(400).json({ error: input.error.flatten() }); return; }
   const value = input.data;
-  const existing = await prisma.device.findUnique({ where: { fcmToken: value.token }, select: { id: true } });
+  let existing = await prisma.device.findUnique({ where: { fcmToken: value.token }, select: { id: true, childId: true } });
+  if (existing?.childId) {
+    // The token moved from a monitored child device; detach it instead of taking that device over.
+    await prisma.device.update({ where: { id: existing.id }, data: { fcmToken: null } });
+    existing = null;
+  }
   const fields = { ownerId: req.principal!.id, platform: value.platform, name: value.name, model: value.model, osVersion: value.osVersion, fcmToken: value.token, status: "ONLINE" as const, lastSeen: new Date() };
   const device = existing
     ? await prisma.device.update({ where: { id: existing.id }, data: fields })
-    : await prisma.device.create({ data: { deviceKey: `fcm:${value.token}`, ...fields } });
+    : await prisma.device.upsert({ where: { deviceKey: `fcm:${value.token}` }, create: { deviceKey: `fcm:${value.token}`, ...fields }, update: fields });
   const pendingNotifications = await prisma.notification.findMany({
     where: { recipientId: req.principal!.id, deliveryStatus: { in: ["PENDING", "FAILED"] }, createdAt: { gte: new Date(Date.now() - 24 * 60 * 60_000) } },
     orderBy: { createdAt: "desc" }, take: 25,
   });
-  await Promise.all(pendingNotifications.map(row => deliver(row.id, req.principal!.id, row.title, row.body, { ...(row.payload as Record<string, unknown>), ...classifyNotificationVoice(row.type) })));
   res.json({ id: device.id });
+  // Re-deliver missed notifications after responding, so registering a token stays fast.
+  void runWithConcurrency(pendingNotifications, 5, row => deliver(row.id, req.principal!.id, row.title, row.body, { ...(row.payload as Record<string, unknown>), ...classifyNotificationVoice(row.type) }));
 }));
 
 app.delete("/api/devices/push-token", authenticate, asyncRoute(async (req, res) => {
@@ -2314,18 +2480,21 @@ app.get("/api/children/:childId/screen-time", authenticate, asyncRoute(async (re
 }));
 
 async function deliver(id: string, recipientId: string, title: string, body: string, payload: Record<string, unknown>) {
-  const preference = await prisma.notificationPreference.findUnique({ where: { userId: recipientId } });
+  const [preference, deviceRows, voice] = await Promise.all([
+    prisma.notificationPreference.findUnique({ where: { userId: recipientId }, select: { pushEnabled: true } }),
+    prisma.device.findMany({ where: { ownerId: recipientId, childId: null, fcmToken: { not: null } }, select: { fcmToken: true } }),
+    prisma.notification.findUnique({ where: { id }, select: { priority: true, voiceEnabled: true, requiresVoiceAlert: true, voiceCategory: true } }),
+  ]);
   if (preference?.pushEnabled === false) {
     await prisma.notification.update({ where: { id }, data: { deliveryStatus: "SKIPPED" } });
     return;
   }
-  const tokens = (await prisma.device.findMany({ where: { ownerId: recipientId, childId: null, fcmToken: { not: null } }, select: { fcmToken: true } })).map(d => d.fcmToken!).filter(Boolean);
+  const tokens = deviceRows.map(d => d.fcmToken!).filter(Boolean);
   if (!tokens.length || !getApps().length) {
     await prisma.notification.update({ where: { id }, data: { deliveryStatus: "FAILED", deliveryError: !tokens.length ? "no_registered_push_token" : "firebase_admin_not_configured" } });
     return;
   }
   try {
-    const voice = await prisma.notification.findUnique({ where: { id }, select: { priority: true, voiceEnabled: true, requiresVoiceAlert: true, voiceCategory: true } });
     const { getMessaging } = await import("firebase-admin/messaging");
     const critical = voice?.priority === "CRITICAL" || voice?.priority === "HIGH";
     const response = await getMessaging().sendEachForMulticast({
@@ -2354,9 +2523,15 @@ function toApiNotification(row: { id: string; recipientId: string; title: string
   return { id: row.id, recipientId: row.recipientId, title: row.title, body: row.body, type: row.type, relatedEntity: row.relatedEntity, relatedId: row.relatedId, payload: row.payload, isRead: row.isRead, createdAt: row.createdAt.toISOString(), readAt: row.readAt?.toISOString() ?? null, deliveryStatus: row.deliveryStatus, childId: row.childId, priority: row.priority, voiceEnabled: row.voiceEnabled, requiresVoiceAlert: row.requiresVoiceAlert, voiceCategory: row.voiceCategory };
 }
 
-app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
-  console.error("API request failed", err);
-  res.status(500).json({ error: "Internal server error" });
+app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
+  if (res.headersSent) return;
+  console.error("API request failed", req.method, req.path, err instanceof Error ? `${err.name}: ${err.message}` : err);
+  const status = err && typeof err === "object" && "status" in err && typeof err.status === "number" && err.status >= 400 && err.status <= 599
+    ? err.status
+    : err && typeof err === "object" && "statusCode" in err && typeof err.statusCode === "number" && err.statusCode >= 400 && err.statusCode <= 599
+      ? err.statusCode
+      : 500;
+  res.status(status).json({ error: status === 413 ? "Voice recording exceeds the 8 MB limit." : "Internal server error" });
 });
 
 function previousNairobiDay() {
@@ -2383,9 +2558,17 @@ async function createDailyUsageSummaries() {
     current.push(device);
     byParent.set(device.ownerId, current);
   }
+  const parentIds = [...byParent.keys()];
+  if (!parentIds.length) return;
+  const [doneRows, languageRows] = await Promise.all([
+    prisma.dailyUsageSummary.findMany({ where: { dayKey, parentId: { in: parentIds } }, select: { parentId: true } }),
+    prisma.aIGuardianSettings.findMany({ where: { userId: { in: parentIds } }, select: { userId: true, language: true } }),
+  ]);
+  const alreadySummarized = new Set(doneRows.map(row => row.parentId));
+  const languageByParent = new Map(languageRows.map(row => [row.userId, row.language]));
   for (const [parentId, parentDevices] of byParent) {
-    if (await prisma.dailyUsageSummary.findUnique({ where: { parentId_dayKey: { parentId, dayKey } }, select: { id: true } })) continue;
-    const language = (await prisma.aIGuardianSettings.findUnique({ where: { userId: parentId }, select: { language: true } }))?.language === "en" ? "en" : "sw";
+    if (alreadySummarized.has(parentId)) continue;
+    const language = languageByParent.get(parentId) === "en" ? "en" : "sw";
     const monitoredDevices = parentDevices.filter(device => device.childId !== null);
     const deviceIds = monitoredDevices.map(device => device.id);
     const events = await prisma.deviceActivityEvent.findMany({ where: { deviceId: { in: deviceIds }, type: "app_usage_summary", createdAt: { gte: start, lt: end } }, orderBy: { createdAt: "desc" }, select: { deviceId: true, payload: true } });
@@ -2443,7 +2626,11 @@ async function createDailyUsageSummaries() {
 }
 
 const port = Number(process.env.PORT) || 8080;
-const server = app.listen(port, () => console.log(`KidGuard API listening on ${port}`));
+const server = app.listen(port, process.env.HOST ?? "0.0.0.0", () => console.log(`KidGuard API listening on ${port}`));
+// Must exceed the reverse proxy's idle timeout to avoid sporadic 502s on reused connections.
+server.keepAliveTimeout = 65_000;
+server.headersTimeout = 66_000;
+server.requestTimeout = 120_000;
 const dailySummaryTimer = setInterval(() => { void createDailyUsageSummaries().catch(error => console.error("Daily usage summary job failed", error)); }, 15 * 60 * 1000);
 const heartbeatAlertTimer = setInterval(() => { void alertForStaleChildDevices().catch(() => console.error("Monitoring heartbeat alert job failed")); }, 5 * 60 * 1000);
 const monitoringRetentionTimer = setInterval(() => { void pruneExpiredMonitoringData().catch(() => console.error("Monitoring retention job failed")); }, 24 * 60 * 60 * 1000);
@@ -2458,12 +2645,26 @@ async function pruneExpiredMonitoringData() {
   await prisma.notification.deleteMany({
     where: { createdAt: { lt: cutoff }, payload: { path: ["retentionClass"], equals: "monitoring_event_v1" } },
   });
+  const heartbeatDays = Number(process.env.HEARTBEAT_RETENTION_DAYS) || 30;
+  await prisma.deviceActivityEvent.deleteMany({ where: { type: "device_heartbeat", createdAt: { lt: new Date(Date.now() - heartbeatDays * 86_400_000) } } });
+  await prisma.aIGuardianRateLimitBucket.deleteMany({ where: { bucketStart: { lt: new Date(Date.now() - 2 * 60 * 60_000) } } });
+  await prisma.emailOtpVerification.deleteMany({ where: { expiresAt: { lt: new Date(Date.now() - 7 * 86_400_000) }, OR: [{ consumedAt: { not: null } }, { verifiedAt: null }] } });
 }
 void pruneExpiredMonitoringData().catch(() => console.error("Monitoring retention job failed"));
 void pruneExpiredLocations().catch(() => console.error("Location retention job failed"));
 void createDailyUsageSummaries().catch(error => console.error("Daily usage summary job failed", error));
 void alertForStaleChildDevices().catch(() => console.error("Monitoring heartbeat alert job failed"));
-for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => server.close(() => { clearInterval(dailySummaryTimer); clearInterval(heartbeatAlertTimer); clearInterval(monitoringRetentionTimer); clearInterval(locationRetentionTimer); void prisma.$disconnect().finally(() => process.exit(0)); }));
+let shuttingDown = false;
+for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  clearInterval(dailySummaryTimer); clearInterval(heartbeatAlertTimer); clearInterval(monitoringRetentionTimer); clearInterval(locationRetentionTimer);
+  limiter.stop();
+  // Force exit if long-lived requests (voice uploads) keep the server open too long.
+  setTimeout(() => process.exit(1), 15_000).unref();
+  server.close(() => { void prisma.$disconnect().finally(() => process.exit(0)); });
+});
+process.on("unhandledRejection", reason => console.error("Unhandled promise rejection", reason instanceof Error ? reason.message : reason));
 
 async function alertForStaleChildDevices() {
   const devices = await prisma.device.findMany({
@@ -2474,7 +2675,7 @@ async function alertForStaleChildDevices() {
   if (!devices.length) return;
   const ids = devices.map(device => device.id);
   const heartbeats = await prisma.deviceActivityEvent.findMany({
-    where: { deviceId: { in: ids }, type: "device_heartbeat" },
+    where: { deviceId: { in: ids }, type: "device_heartbeat", createdAt: { gte: new Date(Date.now() - 14 * 86_400_000) } },
     orderBy: { createdAt: "desc" }, distinct: ["deviceId"],
     select: { deviceId: true, createdAt: true },
   });

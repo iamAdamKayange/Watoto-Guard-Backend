@@ -1,0 +1,45 @@
+{
+	email {$ACME_EMAIL}
+	servers {
+		timeouts {
+			read_body 60s
+			idle 60s
+		}
+	}
+}
+
+{$API_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		-Server
+	}
+
+	# Voice uploads are capped at 8 MB by the API; everything else at 1 MB.
+	@voice path /api/ai/voice/*
+	request_body @voice {
+		max_size 9MB
+	}
+	@other not path /api/ai/voice/*
+	request_body @other {
+		max_size 1MB
+	}
+
+	reverse_proxy api:8080 {
+		health_uri /health
+		health_interval 15s
+		transport http {
+			keepalive 60s
+		}
+	}
+
+	log {
+		output stdout
+		format json
+		level WARN
+	}
+}
