@@ -26,7 +26,17 @@ ask() { # ask VAR "Question" "default"
 ask_secret() { # ask_secret VAR "Question"   (input hidden)
   local reply; read -r -s -p "  $2: " reply; echo; printf -v "$1" '%s' "$reply"
 }
-env_get() { grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | sed -e "s/^'//" -e "s/'$//"; }
+env_get() { # tolerant of nano edits: strips CR, spaces and surrounding ' or " quotes
+  { grep -E "^$1=" "$ENV_FILE" 2>/dev/null || true; } | tail -1 | cut -d= -f2- | tr -d '\r' \
+    | sed -E -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//' -e "s/^'(.*)'$/\1/" -e 's/^"(.*)"$/\1/'
+}
+public_ip() { curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}'; }
+resolve_a() { # public DNS first (what Let's Encrypt sees), then the server's resolver
+  local r
+  r="$(curl -fsS --max-time 6 "https://dns.google/resolve?name=$1&type=A" 2>/dev/null       | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((a["data"] for a in d.get("Answer",[]) if a.get("type")==1),""))' 2>/dev/null || true)"
+  [ -n "$r" ] || r="$( { getent ahostsv4 "$1" || true; } | awk 'NR==1{print $1}')"
+  printf '%s' "$r"
+}
 env_set() { # write KEY='value' (single quotes = literal, no $ interpolation by Docker)
   local key="$1" value="$2" tmp
   [[ "$value" == *"'"* ]] && fail "$key must not contain a single quote (')."
@@ -36,6 +46,7 @@ env_set() { # write KEY='value' (single quotes = literal, no $ interpolation by 
   cat "$tmp" > "$ENV_FILE"; rm -f "$tmp"
 }
 
+{ # whole script is one block: bash reads it fully before executing
 [ "$(id -u)" -eq 0 ] || fail "Run as root (you are $(whoami))."
 printf '%sKidGuard API deploy%s  –  repo: %s\n' "$bold" "$off" "$REPO"
 
@@ -64,7 +75,7 @@ fi
 if [[ "$reconfigure" =~ ^[Yy] ]]; then
   [ -f "$ENV_FILE" ] || cp "$HERE/.env.production.example" "$ENV_FILE"
   chmod 600 "$ENV_FILE"
-  ip="$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
+  ip="$(public_ip)"
   echo "  Press Enter to accept the value in [brackets]. Hidden fields don't show what you type."
 
   ask domain "API domain (no domain? keep the free one)" "$(env_get API_DOMAIN | grep -v example.com || echo "${ip//./-}.sslip.io")"
@@ -115,10 +126,11 @@ db="$(env_get DATABASE_URL)"
 
 # ---------------------------------------------------------------- 4. Checks
 next "Checking DNS and database connection"
-ip="$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
-resolved="$(getent ahostsv4 "$domain" | awk 'NR==1{print $1}')"
+[ -n "$domain" ] || fail "API_DOMAIN is empty in $ENV_FILE."
+ip="$(public_ip)"
+resolved="$(resolve_a "$domain")"
 if [ "$resolved" = "$ip" ]; then ok "$domain → $ip"; else
-  fail "$domain points to '${resolved:-nothing}', not this server ($ip). Fix the DNS A record, then re-run."
+  fail "DNS: '$domain' resolves to '${resolved:-nothing}', but this server is $ip. Check API_DOMAIN in .env (for no domain use ${ip//./-}.sslip.io), then re-run."
 fi
 if [ -n "$db" ]; then
   # psql rejects Prisma-only URL options (connection_limit, pool_timeout, pgbouncer, schema).
@@ -181,3 +193,5 @@ ${bold}Next:${off}
       read -r -s -p "Admin password: " PW; echo
       docker compose exec -e ADMIN_BOOTSTRAP_EMAIL=you@example.com -e ADMIN_BOOTSTRAP_PASSWORD="\$PW" api node dist-scripts/bootstrap-admin.js; unset PW
 EOF
+exit 0
+}
