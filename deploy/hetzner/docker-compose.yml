@@ -53,6 +53,10 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-kidguard}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-kidguard}?connection_limit=15&pool_timeout=20}
       # Hosted AI by default on small servers (set in .env); http://ai:8000 with --profile ai.
       AI_ASSISTANT_HOST: ${AI_ASSISTANT_HOST:-http://ai:8000}
+    # Reachable only from this machine: used by an existing nginx on the host.
+    # Never exposed to the internet (the firewall also blocks it).
+    ports:
+      - "127.0.0.1:${API_HOST_PORT:-8080}:8080"
     networks: [internal, edge]
     deploy:
       resources:
@@ -86,6 +90,9 @@ services:
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
+    # Only when no other web server owns ports 80/443 (COMPOSE_PROFILES contains "caddy").
+    # If nginx already runs on the server, deploy.sh configures nginx instead.
+    profiles: ["caddy"]
     depends_on: [api]
     ports:
       - "80:80"

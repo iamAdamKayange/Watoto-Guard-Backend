@@ -110,13 +110,30 @@ if [[ "$reconfigure" =~ ^[Yy] ]]; then
 fi
 
 # ---- Run KidGuard AI on this server (private network) instead of Render
-if [ "$(env_get AI_ASSISTANT_HOST)" != "http://ai:8000" ] || [ "$(env_get COMPOSE_PROFILES)" != "ai" ]; then
+if [ "$(env_get AI_ASSISTANT_HOST)" != "http://ai:8000" ]; then
   ask v "Run KidGuard AI on this server next to the API? (Y/n)" "y"
-  if [[ "$v" =~ ^[Yy] ]]; then
-    env_set COMPOSE_PROFILES "ai"; env_set AI_ASSISTANT_HOST "http://ai:8000"
-  fi
+  [[ "$v" =~ ^[Yy] ]] && env_set AI_ASSISTANT_HOST "http://ai:8000"
 fi
-ai_local=no; [ "$(env_get COMPOSE_PROFILES)" = "ai" ] && ai_local=yes
+ai_local=no; [ "$(env_get AI_ASSISTANT_HOST)" = "http://ai:8000" ] && ai_local=yes
+
+# ---- Who serves HTTPS? Reuse an existing nginx (other sites keep working) or run Caddy.
+port80_owner="$(ss -ltnpH 'sport = :80' 2>/dev/null | grep -o 'users:(("[^"]*' | head -1 | sed 's/users:(("//' || true)"
+case "$port80_owner" in
+  ""|docker-proxy|caddy) proxy_mode=caddy ;;
+  nginx) proxy_mode=nginx ;;
+  *) fail "Port 80 is used by '$port80_owner'. Stop it, or put KidGuard behind it manually (API listens on 127.0.0.1:8080)." ;;
+esac
+profiles=""
+[ "$ai_local" = yes ] && profiles="ai"
+[ "$proxy_mode" = caddy ] && profiles="${profiles:+$profiles,}caddy"
+env_set COMPOSE_PROFILES "$profiles"
+env_set PROXY_MODE "$proxy_mode"
+# The API is published on localhost for nginx; pick another port if 8080 is taken by something else.
+api_port="$(env_get API_HOST_PORT)"; api_port="${api_port:-8080}"
+if ss -ltnpH "sport = :$api_port" 2>/dev/null | grep -qv docker-proxy && ss -ltnH "sport = :$api_port" | grep -q .; then
+  api_port=18080
+fi
+env_set API_HOST_PORT "$api_port"
 
 # ---- Fill anything missing, so an old .env picks up new keys automatically
 fill_secret() { # fill_secret KEY "prompt" min_len generate(yes/no)
@@ -188,6 +205,7 @@ report SENDLIB_FROM_EMAIL "email sender name" feature
 report FIREBASE_SERVICE_ACCOUNT_JSON "push notifications" feature
 report GOOGLE_CLIENT_IDS "Google sign-in" feature
 [ "$missing" -eq 0 ] || fail "Required keys are missing. Re-run and answer y to re-enter settings."
+ok "HTTPS by: $proxy_mode$([ "$proxy_mode" = nginx ] && echo " (existing nginx; your other sites are not changed)")"
 [ "$ai_local" = yes ] && ok "AI runs on this server (Whisper: $(env_get WHISPER_MODEL), keep models loaded: $(env_get KEEP_MODELS_LOADED), RAM: ${mem_mb} MB)"
 ok "Settings saved to $ENV_FILE (readable by root only)"
 domain="$(env_get API_DOMAIN)"
@@ -216,6 +234,9 @@ fi
 # ---------------------------------------------------------------- 5. Build
 next "Building and starting KidGuard (first time: 5–15 minutes with AI; later runs are quick)"
 cd "$HERE"
+if [ "$proxy_mode" = nginx ]; then
+  docker rm -f kidguard-caddy-1 >/dev/null 2>&1 || true
+fi
 docker compose up -d --build --remove-orphans
 ok "Containers started"
 
@@ -241,11 +262,63 @@ if [ "$ai_local" = yes ]; then
     printf '.'; sleep 3
   done
 fi
+if [ "$proxy_mode" = nginx ]; then
+  if [ -d /etc/nginx/sites-available ] && [ -d /etc/nginx/sites-enabled ]; then
+    site=/etc/nginx/sites-available/kidguard-api; link=/etc/nginx/sites-enabled/kidguard-api
+  else
+    site=/etc/nginx/conf.d/kidguard-api.conf; link=""
+  fi
+  if nginx -T 2>/dev/null | grep -E "^\s*server_name\b.*\b${domain//./\\.}\b" | grep -q . && [ ! -f "$site" ]; then
+    fail "nginx already has a site for $domain. Remove it or choose another API_DOMAIN."
+  fi
+  if [ ! -f "$site" ] || ! grep -q "proxy_pass http://127.0.0.1:$api_port;" "$site"; then
+    cat > "$site" <<NGINX
+# KidGuard API – managed by deploy.sh (certbot adds the HTTPS lines below this block)
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domain;
+
+    # Voice uploads are capped at 8 MB by the API
+    client_max_body_size 9m;
+
+    location / {
+        proxy_pass http://127.0.0.1:$api_port;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Connection "";
+        proxy_read_timeout 120s;
+        proxy_send_timeout 120s;
+    }
+}
+NGINX
+    [ -z "$link" ] || ln -sf "$site" "$link"
+    nginx -t || { rm -f "$site" "$link"; fail "nginx rejected the KidGuard site; nothing was changed."; }
+    systemctl reload nginx
+    ok "nginx site added for $domain (other sites untouched)"
+  else
+    ok "nginx site for $domain already configured"
+  fi
+  if [ ! -d "/etc/letsencrypt/live/$domain" ]; then
+    command -v certbot >/dev/null 2>&1 && dpkg -s python3-certbot-nginx >/dev/null 2>&1 \
+      || apt-get install -y certbot python3-certbot-nginx >/dev/null
+    if certbot --nginx -d "$domain" --non-interactive --agree-tos -m "$(env_get ACME_EMAIL)" --redirect; then
+      ok "HTTPS certificate installed (auto-renews)"
+    else
+      warn "Certificate request failed; the API is reachable over http://$domain for now. Re-run deploy.sh later."
+    fi
+  else
+    ok "HTTPS certificate already present"
+  fi
+fi
 for i in $(seq 1 30); do
   if curl -fsS --max-time 5 "https://$domain/health/ready" >/dev/null 2>&1; then
     ok "HTTPS works: https://$domain"; break
   fi
-  [ "$i" -eq 30 ] && warn "HTTPS not ready yet (certificate may still be issuing). Check: docker compose logs caddy"
+  [ "$i" -eq 30 ] && warn "HTTPS not ready yet. Check: $([ "$proxy_mode" = nginx ] && echo 'journalctl -u nginx -n 30' || echo 'docker compose logs caddy')"
   printf '.'; sleep 4
 done
 
