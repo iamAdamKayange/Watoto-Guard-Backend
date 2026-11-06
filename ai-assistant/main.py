@@ -74,6 +74,8 @@ def _provider_semaphore() -> asyncio.Semaphore:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    if _keep_models_loaded():
+        threading.Thread(target=_warm_up_models, name="voice-warm-up", daemon=True).start()
     try:
         yield
     finally:
@@ -98,6 +100,15 @@ _VOICE_FILES = {
     "en_male": ("en/en_US/hfc_male/medium/en_US-hfc_male-medium.onnx", "en/en_US/hfc_male/medium/en_US-hfc_male-medium.onnx.json"),
 }
 _MODEL_ROOT = Path(__file__).resolve().parent / "models"
+_TRANSIENT_PROVIDER_STATUSES = {429, 500, 502, 503, 504}
+_PROVIDER_RETRY_DELAY_SECONDS = 0.8
+
+
+def _keep_models_loaded() -> bool:
+    """True on servers with enough RAM (>= 4 GB): keep Whisper and Piper voices in
+    memory so each voice turn skips a 1-3 s model reload. False (default) frees RAM
+    after every request, which suits 2 GB servers."""
+    return os.getenv("KEEP_MODELS_LOADED", "false").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _voice_model_path(key: str) -> tuple[Path, Path]:
@@ -149,8 +160,9 @@ def _get_voice(key: str):
         if voice is None:
             model_path, config_path = _ensure_voice_files(key)
             voice = PiperVoice.load(str(model_path), config_path=str(config_path))
-            # Keep one neural voice in RAM; changing language replaces the previous model.
-            _voice_models.clear()
+            if not _keep_models_loaded():
+                # Low-memory mode: keep at most one neural voice in RAM.
+                _voice_models.clear()
             _voice_models[key] = voice
         return voice
 
@@ -193,9 +205,10 @@ def _transcribe_audio(data: bytes, language: str) -> tuple[str, str]:
             detected = info.language if info.language in ("sw", "en") else language
             return transcript[:_MAX_VOICE_TEXT_CHARS], detected
         finally:
-            # Avoid keeping Whisper weights resident alongside the TTS voice on small Render plans.
-            _whisper_model.cache_clear()
-            gc.collect()
+            if not _keep_models_loaded():
+                # Low-memory mode: don't keep Whisper weights resident alongside a TTS voice.
+                _whisper_model.cache_clear()
+                gc.collect()
 
 
 def _synthesize_audio(text: str, language: str, gender: str, rate: float) -> bytes:
@@ -210,8 +223,20 @@ def _synthesize_audio(text: str, language: str, gender: str, rate: float) -> byt
                 voice.synthesize_wav(text, wav_file, syn_config=SynthesisConfig(length_scale=1 / rate))
             return output.getvalue()
         finally:
-            _voice_models.clear()
-            gc.collect()
+            if not _keep_models_loaded():
+                _voice_models.clear()
+                gc.collect()
+
+
+def _warm_up_models() -> None:
+    """Load models once at startup when they are meant to stay resident."""
+    try:
+        with _model_inference_lock:
+            _whisper_model()
+            _get_voice("sw")
+        logger.info("Voice models preloaded")
+    except Exception as error:  # Never block startup; requests load lazily instead.
+        logger.warning("Voice model warm-up skipped (type=%s)", type(error).__name__[:80])
 
 
 class Message(BaseModel):
@@ -242,8 +267,8 @@ def instructions(language: str) -> str:
         f"Reply entirely in {selected_language}; never mix languages. Preserve a person's real name and product/app names, "
         "but explain the rest in the selected language. Use the supplied name and role naturally when useful; do not repeat the name in every reply. "
         "Answer factual KidGuard questions only from the supplied authorized context. The featureCatalogue is the source of truth for app capabilities and navigation; "
-        "Prefer clear, concise, spoken-ready sentences; avoid long lists unless the user asks for detail. "
-        "never claim a feature is available unless it appears there. Distinguish Android-only features and features that depend on a permission, recorded event, subscription, or service configuration. "
+        "never claim a feature is available unless it appears there. "
+        "Prefer clear, concise, spoken-ready sentences; avoid long lists unless the user asks for detail. Distinguish Android-only features and features that depend on a permission, recorded event, subscription, or service configuration. "
         "Use generatedAt and timeZone (Africa/Nairobi) to interpret today/yesterday and timestamps. Cite recorded times naturally when useful. "
         "A missing record means no matching information is available in the supplied records; it does not prove the action never happened. "
         "Never invent names, relationships, events, screen-time values, apps, alerts, notification causes, school results, settings, subscriptions, or dates. "
@@ -282,6 +307,13 @@ def _generate(client: genai.Client, model: str, request: AnswerRequest, context_
     return answer[:3000]
 
 
+def _provider_status(error: Exception) -> int | None:
+    raw_status = getattr(error, "code", None)
+    if not isinstance(raw_status, int):
+        raw_status = getattr(error, "status_code", None)
+    return raw_status if isinstance(raw_status, int) and 400 <= raw_status <= 599 else None
+
+
 @app.get("/health")
 async def health():
     if not os.getenv("GEMINI_API_KEY", "").strip() or len(os.getenv("AI_ASSISTANT_SHARED_SECRET", "").strip()) < 32:
@@ -309,14 +341,18 @@ async def answer(request: AnswerRequest, x_kidguard_ai_secret: str | None = Head
         raise HTTPException(status_code=503, detail="AI service is busy; retry shortly") from None
     try:
         client = _get_gemini_client(api_key)
-        result = await asyncio.to_thread(_generate, client, model, request, context_text)
+        try:
+            result = await asyncio.to_thread(_generate, client, model, request, context_text)
+        except Exception as first_error:
+            if _provider_status(first_error) not in _TRANSIENT_PROVIDER_STATUSES:
+                raise
+            # Gemini often recovers within a second from 429/503; retry once before failing.
+            await asyncio.sleep(_PROVIDER_RETRY_DELAY_SECONDS)
+            result = await asyncio.to_thread(_generate, client, model, request, context_text)
     except Exception as error:
         # Log only a safe classification. Never log exception text, prompts, context,
         # provider response bodies, API keys, or shared secrets.
-        raw_status = getattr(error, "code", None)
-        if not isinstance(raw_status, int):
-            raw_status = getattr(error, "status_code", None)
-        status = raw_status if isinstance(raw_status, int) and 400 <= raw_status <= 599 else None
+        status = _provider_status(error)
         provider_type = type(error).__name__[:80]
         logger.warning("Gemini request failed (type=%s, status=%s)", provider_type, status or "unknown")
         if status == 429:

@@ -260,6 +260,60 @@ class AssistantTests(unittest.TestCase):
         self.assertEqual(failed.status_code, 502)
         self.assertNotIn("private text", failed.text)
 
+    def test_transient_provider_error_is_retried_once_then_succeeds(self):
+        class FlakyModels:
+            calls = 0
+
+            def generate_content(self, **kwargs):
+                FlakyModels.calls += 1
+                if FlakyModels.calls == 1:
+                    error = RuntimeError("busy")
+                    error.code = 503
+                    raise error
+                return FakeResponse()
+
+        class FlakyClient:
+            def __init__(self, **kwargs):
+                self.models = FlakyModels()
+
+        with patch.dict(os.environ, {"AI_ASSISTANT_SHARED_SECRET": "s" * 40, "GEMINI_API_KEY": "test-key"}), \
+                patch.object(main.genai, "Client", FlakyClient), patch.object(main, "_PROVIDER_RETRY_DELAY_SECONDS", 0):
+            result = asyncio.run(main.answer(self.request(), "s" * 40))
+        self.assertEqual(result["answer"], FakeResponse.text)
+        self.assertEqual(FlakyModels.calls, 2)
+
+    def test_non_transient_provider_error_is_not_retried(self):
+        class RejectingModels:
+            calls = 0
+
+            def generate_content(self, **kwargs):
+                RejectingModels.calls += 1
+                error = RuntimeError("bad key")
+                error.code = 403
+                raise error
+
+        class RejectingClient:
+            def __init__(self, **kwargs):
+                self.models = RejectingModels()
+
+        with patch.dict(os.environ, {"AI_ASSISTANT_SHARED_SECRET": "s" * 40, "GEMINI_API_KEY": "test-key"}), \
+                patch.object(main.genai, "Client", RejectingClient), patch.object(main, "_PROVIDER_RETRY_DELAY_SECONDS", 0):
+            with self.assertRaises(HTTPException) as caught:
+                asyncio.run(main.answer(self.request(), "s" * 40))
+        self.assertEqual(caught.exception.status_code, 503)
+        self.assertEqual(RejectingModels.calls, 1)
+
+    def test_keep_models_loaded_flag(self):
+        for value, expected in [("true", True), ("1", True), ("false", False), ("", False)]:
+            with patch.dict(os.environ, {"KEEP_MODELS_LOADED": value}):
+                self.assertEqual(main._keep_models_loaded(), expected)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(main._keep_models_loaded())
+
+    def test_prompt_keeps_feature_rule_in_one_sentence(self):
+        prompt = main.instructions("sw")
+        self.assertIn("source of truth for app capabilities and navigation; never claim a feature is available", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

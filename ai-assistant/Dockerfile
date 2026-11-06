@@ -8,6 +8,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf 
 COPY requirements.txt ./
 RUN pip install -r requirements.txt
 COPY . .
+# The Whisper model downloaded at build time must match the one used at runtime.
+ARG WHISPER_MODEL=base
+ENV WHISPER_MODEL=${WHISPER_MODEL}
 RUN python download_models.py && useradd --create-home --uid 10001 app && chown -R app /app
 USER app
 EXPOSE 8000

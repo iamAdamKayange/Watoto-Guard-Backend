@@ -62,15 +62,20 @@ services:
   ai:
     build:
       context: ../../ai-assistant
+      args:
+        WHISPER_MODEL: ${WHISPER_MODEL:-base}
     restart: unless-stopped
+    # Enabled by COMPOSE_PROFILES=ai in .env (deploy.sh sets it when AI runs on this server).
     profiles: ["ai"]
     environment:
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash-lite}
       AI_ASSISTANT_SHARED_SECRET: ${AI_ASSISTANT_SHARED_SECRET:-}
-      WHISPER_MODEL: ${WHISPER_MODEL:-tiny}
+      WHISPER_MODEL: ${WHISPER_MODEL:-base}
       WHISPER_COMPUTE_TYPE: int8
       WHISPER_CPU_THREADS: ${WHISPER_CPU_THREADS:-2}
+      # true on >= 4 GB RAM servers: faster voice (models stay in memory).
+      KEEP_MODELS_LOADED: ${KEEP_MODELS_LOADED:-false}
     # "edge" gives outbound internet (Gemini API); no ports are published for this service.
     networks: [internal, edge]
     deploy:

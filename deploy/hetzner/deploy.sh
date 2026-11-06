@@ -71,56 +71,125 @@ next "Configuring settings (.env)"
 reconfigure=y
 if [ -f "$ENV_FILE" ]; then
   ask reconfigure "Settings already exist. Re-enter them? (y/N)" "n"
+else
+  cp "$HERE/.env.production.example" "$ENV_FILE"
 fi
-if [[ "$reconfigure" =~ ^[Yy] ]]; then
-  [ -f "$ENV_FILE" ] || cp "$HERE/.env.production.example" "$ENV_FILE"
-  chmod 600 "$ENV_FILE"
-  ip="$(public_ip)"
-  echo "  Press Enter to accept the value in [brackets]. Hidden fields don't show what you type."
+chmod 600 "$ENV_FILE"
+ip="$(public_ip)"
+mem_mb="$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)"
+is_placeholder() { [[ -z "$1" || "$1" == CHANGE_ME* || "$1" == *example.com* || "$1" == *your-connected* ]]; }
+echo "  Press Enter to accept the value in [brackets]. Hidden fields don't show what you type."
 
-  ask domain "API domain (no domain? keep the free one)" "$(env_get API_DOMAIN | grep -v example.com || echo "${ip//./-}.sslip.io")"
-  ask acme   "Email for the HTTPS certificate" "$(env_get ACME_EMAIL | grep -v example.com || true)"
-  [ -n "$acme" ] || fail "An email is required for the HTTPS certificate."
-  env_set API_DOMAIN "$domain"; env_set ACME_EMAIL "$acme"
+if [[ "$reconfigure" =~ ^[Yy] ]]; then
+  ask domain "API domain (no domain? keep the free one)" "$(v="$(env_get API_DOMAIN)"; is_placeholder "$v" && echo "${ip//./-}.sslip.io" || echo "$v")"
+  env_set API_DOMAIN "$domain"
+  ask acme "Email for the HTTPS certificate" "$(v="$(env_get ACME_EMAIL)"; is_placeholder "$v" || echo "$v")"
+  env_set ACME_EMAIL "$acme"
 
   echo; echo "  ${bold}Database${off}: paste your Neon URL (Neon → Connect → turn OFF connection pooling)."
-  ask_secret db "DATABASE_URL (Enter = keep current)"
-  db="${db:-$(env_get DATABASE_URL)}"
-  [[ "$db" =~ ^postgres(ql)?:// ]] || fail "DATABASE_URL must start with postgresql://"
-  if [[ "$db" == *"-pooler."* ]]; then
-    db="${db/-pooler./.}"; warn "Switched Neon pooled host to the direct host (needed for migrations)."
-  fi
-  [[ "$db" == *"sslmode="* ]] || { [[ "$db" == *"?"* ]] && db="$db&sslmode=require" || db="$db?sslmode=require"; }
-  [[ "$db" == *"connection_limit="* ]] || db="$db&connection_limit=10"
-  env_set DATABASE_URL "$db"
+  echo "  Type 'local' to use a PostgreSQL database on this server instead."
+  ask_secret v "DATABASE_URL (Enter = keep current)"
+  [ "$v" = "local" ] && env_set DATABASE_URL "" || { [ -z "$v" ] || env_set DATABASE_URL "$v"; }
 
   echo; echo "  ${bold}Secrets${off}: copy them from Render → kidguard-api → Environment."
-  ask_secret v "AUTH_TOKEN_SECRET from Render (keeps users logged in; Enter = generate new)"
-  [ -n "$v" ] || v="$(env_get AUTH_TOKEN_SECRET | grep -v CHANGE_ME || openssl rand -hex 48)"
-  [ "${#v}" -ge 32 ] || fail "AUTH_TOKEN_SECRET must be at least 32 characters."
-  env_set AUTH_TOKEN_SECRET "$v"
-  ask_secret v "SENDLIB_API_KEY (email OTP; Enter = keep/skip)"; [ -z "$v" ] || env_set SENDLIB_API_KEY "$v"
-  ask v "SENDLIB_FROM_EMAIL" "$(env_get SENDLIB_FROM_EMAIL | grep -v your-connected || true)"; [ -z "$v" ] || env_set SENDLIB_FROM_EMAIL "$v"
-  ask v "GOOGLE_CLIENT_IDS (comma separated; Enter = keep/skip)" "$(env_get GOOGLE_CLIENT_IDS)"; env_set GOOGLE_CLIENT_IDS "$v"
-  ask_secret v "AI_ASSISTANT_SHARED_SECRET (same as Render; Enter = keep/skip)"; [ -z "$v" ] || env_set AI_ASSISTANT_SHARED_SECRET "$v"
+  ask_secret v "AUTH_TOKEN_SECRET from Render (keeps users logged in; Enter = keep/generate)"
+  [ -z "$v" ] || env_set AUTH_TOKEN_SECRET "$v"
+  ask_secret v "SENDLIB_API_KEY (Enter = keep)"; [ -z "$v" ] || env_set SENDLIB_API_KEY "$v"
+  ask v "SENDLIB_FROM_EMAIL" "$(v="$(env_get SENDLIB_FROM_EMAIL)"; is_placeholder "$v" || echo "$v")"; [ -z "$v" ] || env_set SENDLIB_FROM_EMAIL "$v"
+  ask v "GOOGLE_CLIENT_IDS (comma separated)" "$(env_get GOOGLE_CLIENT_IDS)"; env_set GOOGLE_CLIENT_IDS "$v"
+  ask_secret v "GEMINI_API_KEY for KidGuard AI (Enter = keep)"; [ -z "$v" ] || env_set GEMINI_API_KEY "$v"
 
   echo; echo "  ${bold}Firebase (push notifications)${off}: paste the service-account JSON, then press Enter and Ctrl+D."
-  echo "  (Just press Ctrl+D to keep/skip.)"
+  echo "  (Just press Ctrl+D to keep the current one.)"
   fb="$(cat || true)"
   if [ -n "${fb//[[:space:]]/}" ]; then
     fb="$(printf '%s' "$fb" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin), separators=(",",":")))')" \
       || fail "That Firebase JSON is not valid. Paste the whole file content."
     env_set FIREBASE_SERVICE_ACCOUNT_JSON "$fb"
   fi
-
-  # Server-only secrets that never need to match Render
-  [[ "$(env_get POSTGRES_PASSWORD)" =~ ^(|CHANGE_ME.*)$ ]] && env_set POSTGRES_PASSWORD "$(openssl rand -hex 32)"
-  [[ "$(env_get OTP_HASH_SECRET)" =~ ^(|CHANGE_ME.*)$ ]] && env_set OTP_HASH_SECRET "$(openssl rand -hex 48)"
-  chmod 600 "$ENV_FILE"
-  ok "Settings saved to $ENV_FILE (readable by root only)"
-else
-  ok "Keeping existing settings"
 fi
+
+# ---- Run KidGuard AI on this server (private network) instead of Render
+if [ "$(env_get AI_ASSISTANT_HOST)" != "http://ai:8000" ] || [ "$(env_get COMPOSE_PROFILES)" != "ai" ]; then
+  ask v "Run KidGuard AI on this server next to the API? (Y/n)" "y"
+  if [[ "$v" =~ ^[Yy] ]]; then
+    env_set COMPOSE_PROFILES "ai"; env_set AI_ASSISTANT_HOST "http://ai:8000"
+  fi
+fi
+ai_local=no; [ "$(env_get COMPOSE_PROFILES)" = "ai" ] && ai_local=yes
+
+# ---- Fill anything missing, so an old .env picks up new keys automatically
+fill_secret() { # fill_secret KEY "prompt" min_len generate(yes/no)
+  local key="$1" cur; cur="$(env_get "$key")"
+  if is_placeholder "$cur" || [ "${#cur}" -lt "$3" ]; then
+    if [ "$4" = yes ]; then env_set "$key" "$(openssl rand -hex 48)"; ok "$key generated"
+    else
+      ask_secret cur "$2"
+      [ "${#cur}" -ge "$3" ] || fail "$key is required (at least $3 characters)."
+      env_set "$key" "$cur"
+    fi
+  fi
+}
+v="$(env_get API_DOMAIN)"; is_placeholder "$v" && env_set API_DOMAIN "${ip//./-}.sslip.io"
+v="$(env_get ACME_EMAIL)"; if is_placeholder "$v"; then ask v "Email for the HTTPS certificate" ""; [ -n "$v" ] || fail "ACME_EMAIL is required."; env_set ACME_EMAIL "$v"; fi
+fill_secret POSTGRES_PASSWORD "" 16 yes
+fill_secret OTP_HASH_SECRET "" 32 yes
+fill_secret AUTH_TOKEN_SECRET "" 32 yes
+if [ "$ai_local" = yes ]; then
+  # Both API and AI read this same file, so a fresh random secret always matches.
+  fill_secret AI_ASSISTANT_SHARED_SECRET "" 32 yes
+  fill_secret GEMINI_API_KEY "GEMINI_API_KEY (https://aistudio.google.com/apikey)" 20 no
+  [ -n "$(env_get WHISPER_MODEL)" ] || env_set WHISPER_MODEL base
+  [ -n "$(env_get WHISPER_CPU_THREADS)" ] || env_set WHISPER_CPU_THREADS 2
+  [ -n "$(env_get GEMINI_MODEL)" ] || env_set GEMINI_MODEL gemini-3.5-flash-lite
+  if [ -z "$(env_get KEEP_MODELS_LOADED)" ]; then
+    [ "$mem_mb" -ge 3500 ] && env_set KEEP_MODELS_LOADED true || env_set KEEP_MODELS_LOADED false
+  fi
+else
+  fill_secret AI_ASSISTANT_SHARED_SECRET "AI_ASSISTANT_SHARED_SECRET (same as the Render AI service)" 32 no
+fi
+[ -n "$(env_get CORS_ORIGINS)" ] || env_set CORS_ORIGINS "https://kidguard-admin-site.vercel.app"
+
+# ---- Normalise the database URL (Neon direct host, SSL, pool size)
+db="$(env_get DATABASE_URL)"
+if [ -n "$db" ]; then
+  [[ "$db" =~ ^postgres(ql)?:// ]] || fail "DATABASE_URL must start with postgresql:// (or type 'local' when asked)."
+  if [[ "$db" == *"-pooler."* ]]; then
+    db="${db/-pooler./.}"; warn "Switched Neon pooled host to the direct host (needed for migrations)."
+  fi
+  [[ "$db" == *"sslmode="* ]] || { [[ "$db" == *"?"* ]] && db="$db&sslmode=require" || db="$db?sslmode=require"; }
+  [[ "$db" == *"connection_limit="* ]] || db="$db&connection_limit=10"
+  env_set DATABASE_URL "$db"
+fi
+chmod 600 "$ENV_FILE"
+
+# ---- Key report
+echo; echo "  ${bold}Key check${off} (values are hidden):"
+report() { # report KEY "what it is for" required|feature
+  local v; v="$(env_get "$1")"
+  if is_placeholder "$v"; then
+    if [ "$3" = required ]; then printf '  %s✘%s %-30s %s\n' "$red" "$off" "$1" "MISSING – $2"; missing=1
+    else printf '  %s–%s %-30s %s\n' "$yellow" "$off" "$1" "not set – $2 won't work"; fi
+  else printf '  %s✔%s %-30s %s\n' "$green" "$off" "$1" "$2"; fi
+}
+missing=0
+report API_DOMAIN "HTTPS address" required
+report ACME_EMAIL "HTTPS certificate" required
+if [ -n "$(env_get DATABASE_URL)" ]; then report DATABASE_URL "Neon / external database" required
+else ok "DATABASE_URL                   built-in PostgreSQL on this server"; fi
+report POSTGRES_PASSWORD "database container" required
+report AUTH_TOKEN_SECRET "login sessions" required
+report OTP_HASH_SECRET "email codes" required
+report AI_ASSISTANT_HOST "API → AI address" required
+report AI_ASSISTANT_SHARED_SECRET "API ↔ AI secret" required
+[ "$ai_local" = yes ] && report GEMINI_API_KEY "AI answers (Gemini)" required
+report SENDLIB_API_KEY "registration codes, password reset, invitations" feature
+report SENDLIB_FROM_EMAIL "email sender name" feature
+report FIREBASE_SERVICE_ACCOUNT_JSON "push notifications" feature
+report GOOGLE_CLIENT_IDS "Google sign-in" feature
+[ "$missing" -eq 0 ] || fail "Required keys are missing. Re-run and answer y to re-enter settings."
+[ "$ai_local" = yes ] && ok "AI runs on this server (Whisper: $(env_get WHISPER_MODEL), keep models loaded: $(env_get KEEP_MODELS_LOADED), RAM: ${mem_mb} MB)"
+ok "Settings saved to $ENV_FILE (readable by root only)"
 domain="$(env_get API_DOMAIN)"
 db="$(env_get DATABASE_URL)"
 
@@ -145,7 +214,7 @@ else
 fi
 
 # ---------------------------------------------------------------- 5. Build
-next "Building and starting KidGuard (first time: 3–6 minutes)"
+next "Building and starting KidGuard (first time: 5–15 minutes with AI; later runs are quick)"
 cd "$HERE"
 docker compose up -d --build --remove-orphans
 ok "Containers started"
@@ -159,6 +228,19 @@ for i in $(seq 1 60); do
   [ "$i" -eq 60 ] && { docker compose logs --tail=60 api; fail "API did not become healthy. Logs are above."; }
   printf '.'; sleep 3
 done
+if [ "$ai_local" = yes ]; then
+  for i in $(seq 1 60); do
+    # Checked from inside the API container: proves the API can reach the AI and the secret/key are set.
+    if docker compose exec -T api curl -fsS http://ai:8000/health >/dev/null 2>&1; then
+      ok "KidGuard AI healthy and reachable from the API"; break
+    fi
+    if [ "$i" -eq 60 ]; then
+      docker compose logs --tail=40 ai
+      warn "AI is not healthy yet. The app still works; AI answers will fail until this is fixed (logs above)."
+    fi
+    printf '.'; sleep 3
+  done
+fi
 for i in $(seq 1 30); do
   if curl -fsS --max-time 5 "https://$domain/health/ready" >/dev/null 2>&1; then
     ok "HTTPS works: https://$domain"; break
@@ -182,7 +264,8 @@ cat <<EOF
 ${bold}${green}KidGuard API is live${off}
   URL:      https://$domain
   Health:   https://$domain/health/ready
-  Logs:     cd $HERE && docker compose logs -f api
+  Logs:     cd $HERE && docker compose logs -f api      (AI: docker compose logs -f ai)
+  Memory:   docker stats --no-stream
   Update:   bash $HERE/deploy.sh   (answer N to keep settings)
 
 ${bold}Next:${off}
